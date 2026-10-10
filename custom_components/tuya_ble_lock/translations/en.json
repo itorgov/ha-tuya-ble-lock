@@ -115,6 +115,11 @@
     }
   },
   "entity": {
+    "button": {
+      "unlock": {
+        "name": "Unlock"
+      }
+    },
     "sensor": {
       "battery": {
         "name": "Battery"

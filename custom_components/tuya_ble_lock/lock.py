@@ -1,18 +1,17 @@
 """Expose the standard Home Assistant unlock action."""
 
-from dataclasses import replace
 from typing import Any
 
 from homeassistant.components.lock import LockEntity
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import TuyaBLELockConfigEntry
 from .const import DOMAIN
 from .coordinator import GatewayCoordinator
 from .entity import TuyaLockEntity
-from .local import LocalError, LockConfig
+from .local import LockConfig
 
 PARALLEL_UPDATES = 0
 
@@ -40,17 +39,7 @@ class TuyaBLELock(TuyaLockEntity, LockEntity):
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Use an existing code; never register a new key or retry a write."""
-        lock = self.lock_config
-        if (code := kwargs.get("code")) is not None:
-            lock = replace(lock, remote_unlock_code=code)
-        if not lock.remote_unlock_code:
-            raise ServiceValidationError(translation_domain=DOMAIN, translation_key="missing_code")
-        try:
-            await self.coordinator.async_unlock(lock)
-        except LocalError:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN, translation_key="unlock_failed"
-            ) from None
+        await self._async_unlock(kwargs.get("code"))
         # A later matching DP61 report is not proof of physical movement.
         # Leave state unknown, including for locks that automatically relock.
 

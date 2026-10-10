@@ -10,7 +10,7 @@ from .const import CONF_GATEWAY_ID, CONF_LOCAL_KEY, CONF_LOCKS, CONF_VERSION, DO
 from .coordinator import GatewayCoordinator
 from .local import GatewayClient, LockConfig
 
-PLATFORMS = [Platform.LOCK, Platform.SENSOR]
+PLATFORMS = [Platform.BUTTON, Platform.LOCK, Platform.SENSOR]
 type TuyaBLELockConfigEntry = ConfigEntry[GatewayCoordinator]
 
 
@@ -58,9 +58,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: TuyaBLELockConfigEntry)
 def _remove_stale_devices(hass: HomeAssistant, entry: TuyaBLELockConfigEntry) -> None:
     """Remove only this integration's registry records for removed children."""
     valid_ids = {lock.device_id for lock in entry.runtime_data.locks}
+    valid_entity_ids = valid_ids | {
+        f"{device_id}_{suffix}" for device_id in valid_ids for suffix in ("battery", "unlock")
+    }
     entity_registry = er.async_get(hass)
     for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id):
-        if entity.unique_id not in valid_ids | {f"{device_id}_battery" for device_id in valid_ids}:
+        if entity.unique_id not in valid_entity_ids:
             entity_registry.async_remove(entity.entity_id)
     device_registry = dr.async_get(hass)
     for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):

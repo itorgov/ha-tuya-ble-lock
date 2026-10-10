@@ -1,11 +1,14 @@
 """Common lock device information."""
 
+from dataclasses import replace
+
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import GatewayCoordinator
-from .local import LockConfig, LockStatus
+from .local import LocalError, LockConfig, LockStatus
 
 
 class TuyaLockEntity(CoordinatorEntity[GatewayCoordinator]):
@@ -35,3 +38,17 @@ class TuyaLockEntity(CoordinatorEntity[GatewayCoordinator]):
     def available(self) -> bool:
         """Distinguish child reachability from gateway reachability."""
         return super().available and bool(self.lock_status and self.lock_status.online)
+
+    async def _async_unlock(self, code: str | None = None) -> None:
+        """Send one unlock command through the shared gateway queue."""
+        lock = self.lock_config
+        if code is not None:
+            lock = replace(lock, remote_unlock_code=code)
+        if not lock.remote_unlock_code:
+            raise ServiceValidationError(translation_domain=DOMAIN, translation_key="missing_code")
+        try:
+            await self.coordinator.async_unlock(lock)
+        except LocalError:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="unlock_failed"
+            ) from None

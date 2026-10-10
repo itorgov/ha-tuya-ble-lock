@@ -1,6 +1,6 @@
 # Tuya BLE Lock for Home Assistant
 
-Control compatible Tuya Bluetooth locks from Home Assistant through their existing Wi-Fi/Bluetooth gateway. Each configured lock appears as a separate device with a `lock` entity, ready for dashboards, scripts, and automations such as a wireless button that unlocks a door.
+Control compatible Tuya Bluetooth locks from Home Assistant through their existing Wi-Fi/Bluetooth gateway. Each configured lock appears as a separate device with an **Unlock** button for direct control and a `lock` entity for scripts and automations, such as a wireless button that unlocks a door.
 
 Requires **Home Assistant 2026.10 or newer**.
 
@@ -27,7 +27,7 @@ This is a custom integration for the **HX201-style DP61 remote-unlock protocol**
 
 Your lock must support the raw `remote_no_dp_key` / DP61 command and have an existing eight-digit remote unlock code. Tuya branding, Bluetooth support, or discovery alone does not establish compatibility. The integration does not create remote codes, enroll users, pair devices, or program fingerprints/cards.
 
-- **Supported:** unlock through `lock.unlock`, separate devices for multiple locks, local availability checks, UI configuration.
+- **Supported:** an explicit **Unlock** button, the standard `lock.unlock` action, separate devices for multiple locks, local availability checks, UI configuration.
 - **Not supported:** locking, unlatching as a separate action, key registration, or reliable locked/unlocked feedback.
 - **State:** a reachable lock can show **Unknown**. A command acknowledgement does not prove physical movement. The integration does not invent a locked state or an automatic relock timer.
 - **No automatic unlock retry:** if a command times out, it might already have opened the lock. Check the door before trying again.
@@ -125,9 +125,11 @@ Some products hide the command value, use a different format, or rotate the code
 2. Choose **Discover locks with Tuya Cloud**. Enter the project's Access ID, Secret, data center, and the **gateway Device ID**. This retrieves the gateway local key and its child devices.
 3. Enter the gateway's **local IP** and verified **LAN protocol version**. Leave the local-key field blank to retain the imported key.
 4. Select the compatible locks you want to add. For each lock, confirm the supported DP61 profile and enter its remote unlock code and member, or paste the existing DP61 command from step 4. Discovery cannot verify mechanical behavior or code validity without unlocking.
-5. Select **Save** in the lock-management menu. Each configured lock has its own device and `lock` entity, linked to the gateway. You can leave a code blank to complete discovery, but unlocking remains unavailable until you supply it. Repeat for another gateway.
+5. Select **Save** in the lock-management menu. Each configured lock has its own device, **Unlock** button, and `lock` entity, linked to the gateway. You can leave a code blank to complete discovery, but unlocking remains unavailable until you supply it. Repeat for another gateway.
 
-Setup only reads cloud/device information; it does not unlock anything. Perform your first explicit unlock from **Developer tools → Actions → Lock: Unlock** while beside the door. Select the new entity and run the action once.
+Setup only reads cloud/device information; it does not unlock anything. While beside the door, open the lock's device page and choose **Press** beside **Unlock**. Alternatively, use **Developer tools → Actions → Lock: Unlock**, select the lock entity, and run the action once.
+
+Use the **Unlock** button for device-page and dashboard controls. The generic lock row may show **Lock** because the physical state is unknown; that unsupported action does not open the lock. The button always sends the explicit unlock command using the saved code. Its last-pressed timestamp records an attempt, not confirmation that the lock physically opened.
 
 ### Manual setup
 
@@ -169,6 +171,8 @@ actions:
 
 Replace `lock.front_door` with the actual entity ID. The stored remote code is used automatically; keep it out of automation YAML and traces. Use an explicit unlock action rather than a toggle, because the integration does not know the physical lock state. [Home Assistant lock actions](https://www.home-assistant.io/integrations/lock/).
 
+You can also use **Button: Press** (`button.press`) targeting the device's **Unlock** button. Both actions use the same local command and gateway queue; choose one action per trigger to avoid sending duplicate unlocks.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -178,6 +182,7 @@ Replace `lock.front_door` with the actual entity ID. The stored remote code is u
 | Gateway or locks missing from cloud | Correct app account, data center, and gateway binding. A phone-only BLE lock is not a gateway child. |
 | Gateway cannot connect | Private IP, TCP 6668, correct gateway ID/local key/protocol, no Wi-Fi client isolation. Stop other local clients temporarily; some gateways allow few simultaneous connections. |
 | Child offline or missing | Exact node ID; Bluetooth range; batteries; lock listed under this gateway. Wake the lock if its model sleeps. |
+| Device page shows Lock / "This profile supports unlocking only" | Use **Press** beside **Unlock**, or run **Lock: Unlock** from Developer tools → Actions. The generic lock row cannot choose the correct action from an unknown physical state. If the Unlock button is missing, update the integration to 0.1.1 or newer and restart Home Assistant. |
 | Unlock rejected | Correct currently registered remote code and member. App activity can replace a code on some models. Do not guess codes or repeatedly retry. |
 | Unlock timeout / outcome unknown | The command may have executed. Inspect the lock before retrying; no cloud fallback or automatic repeat is performed. |
 | Entity state remains Unknown | Expected: availability and command responses do not establish whether the bolt is locked. |
