@@ -1,0 +1,14 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+.env
+.env.*
+*.private.*
+secrets.yaml
+config/.storage/

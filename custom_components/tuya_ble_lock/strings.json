@@ -1,0 +1,135 @@
+{
+  "title": "Tuya BLE Lock",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Tuya BLE Lock",
+        "menu_options": {
+          "cloud": "Discover locks with Tuya Cloud",
+          "gateway": "Enter local gateway details manually"
+        }
+      },
+      "cloud": {
+        "title": "Read gateway details from Tuya",
+        "description": "Use a linked Smart Home cloud project. Credentials are used only for this setup session and are not saved. No unlock command is sent. See the README for project setup.",
+        "data": {
+          "region": "Project data center",
+          "client_id": "Access ID / Client ID",
+          "client_secret": "Access Secret / Client Secret",
+          "gateway_id": "Gateway device ID"
+        }
+      },
+      "gateway": {
+        "title": "Connect to the local gateway",
+        "description": "Use the gateway LAN IPv4 address, device ID, 16-byte Local Key and protocol version. If a key was already imported or saved, leave it blank to keep it. This step only reads child connectivity.",
+        "data": {
+          "name": "Gateway name",
+          "host": "Gateway IPv4 address",
+          "gateway_id": "Gateway device ID",
+          "local_key": "Gateway Local Key",
+          "protocol_version": "LAN protocol version"
+        }
+      },
+      "select_locks": {
+        "title": "Select discovered locks",
+        "description": "Select compatible candidates to configure. {unsupported} other children could not be identified as the supported DP61 profile. Check compatibility before adding a lock.",
+        "data": {
+          "locks": "Locks"
+        }
+      },
+      "no_locks": {
+        "title": "No new compatible locks found",
+        "description": "No unconfigured child has the required writable raw DP61 signature. Check cloud API permissions, gateway pairing and compatibility. You may enter a known supported lock manually.",
+        "data": {}
+      },
+      "manage": {
+        "title": "Manage locks",
+        "description": "Add the locks you want, then choose Save. Nothing is sent to a lock during setup.",
+        "menu_options": {
+          "manual_lock": "Add a lock manually",
+          "cloud": "Discover with Tuya Cloud",
+          "edit_lock": "Edit a lock or its code",
+          "remove_lock": "Remove a lock from this integration",
+          "finish": "Save"
+        }
+      },
+      "manual_lock": {
+        "title": "Identify a supported Bluetooth lock",
+        "description": "Enter the exact device ID and node_id from Tuya. The node must appear in the gateway topology. Do not substitute its MAC address.",
+        "data": {
+          "name": "Lock name",
+          "device_id": "Lock device ID",
+          "node_id": "Exact child node_id"
+        }
+      },
+      "lock": {
+        "title": "Configure the existing unlock code",
+        "description": "Confirm the supported HX201-style DP61 profile described in the README. Enter an existing eight-digit remote unlock code and member number, OR paste the Base64 value of your own successful DP61 unlock command. The payload overrides member/code fields and is not stored. Leave credentials blank for status only, or to retain a saved code. Local Key and keypad PIN are different credentials.",
+        "data": {
+          "name": "Lock name",
+          "confirm_profile": "My lock uses the supported DP61 profile",
+          "member": "Member number",
+          "remote_unlock_code": "Existing eight-digit remote unlock code",
+          "unlock_payload": "Existing DP61 command (Base64)",
+          "clear_code": "Remove the saved unlock code"
+        }
+      },
+      "edit_lock": {
+        "title": "Choose a lock to edit",
+        "data": {
+          "device_id": "Lock"
+        }
+      },
+      "remove_lock": {
+        "title": "Remove a lock",
+        "description": "This removes its Home Assistant configuration when you save. It does not unpair the lock from Tuya.",
+        "data": {
+          "device_id": "Lock"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Tuya rejected the project credentials or authorization. Check the data center, credentials and authorized API services.",
+      "cloud_error": "Cannot read Tuya device metadata. Check project linking, API permissions, subscription and gateway ID.",
+      "invalid_input": "Check the IPv4 address, exact IDs, 16-byte Local Key and protocol version.",
+      "cannot_connect": "Cannot read local gateway topology. Check the address, Local Key, protocol, network access and other local clients.",
+      "no_locks_selected": "Select at least one available lock.",
+      "duplicate_lock": "This lock or child node is already configured.",
+      "node_not_found": "The exact node_id was not reported by this gateway. Check pairing and node_id.",
+      "invalid_credentials": "Confirm compatibility and enter eight ASCII digits with a member number from 1 to 65534, or a valid 13-byte DP61 command."
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured. Use Reconfigure to edit it.",
+      "reconfigure_successful": "Gateway and lock settings updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Polling interval",
+        "description": "Read local gateway and child status every 30 to 600 seconds. This never unlocks a lock.",
+        "data": {
+          "scan_interval": "Polling interval (seconds)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "battery": {
+        "name": "Battery"
+      }
+    }
+  },
+  "exceptions": {
+    "missing_code": {
+      "message": "Configure an existing remote unlock code through Reconfigure, or supply code to lock.unlock."
+    },
+    "locking_unsupported": {
+      "message": "This profile supports unlocking only. Physical locking is handled by the lock itself."
+    },
+    "unlock_failed": {
+      "message": "Unlock could not be verified; the command may have reached the lock. Check its physical state before trying again. No automatic retry was sent."
+    }
+  }
+}

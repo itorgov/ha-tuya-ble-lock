@@ -1,0 +1,5 @@
+homeassistant==2026.10.0
+pytest-homeassistant-custom-component==0.13.371
+tinytuya==1.20.0
+pytest-cov==7.1.0
+ruff==0.17.0
