@@ -10,6 +10,17 @@ Home Assistant ── local network ── Tuya gateway ── Bluetooth ── 
 
 Tuya Cloud helps retrieve gateway credentials and discover its child devices during setup. Its API credentials are not saved. Unlocking and availability checks then use the local network. Home Assistant does not need a Bluetooth adapter. Manual setup is available if you already have the required device details.
 
+## Supported devices
+
+The local unlock command used by this integration was verified with this gateway and lock together, using gateway LAN protocol **3.5**:
+
+| Device | Retail brand / model | Model reported by Tuya | Tuya Product ID (PID) |
+| --- | --- | --- | --- |
+| Wi-Fi/Bluetooth gateway | **MOES BHUB-C** — Wireless Smart Gateway (BLE) | `CR3L Bluetooth Gateway` | `csvxfq3ecmedidkh` |
+| Bluetooth drawer/cabinet lock | **T1 tuya** — labeled "Smart Drawer Switch" on the packaging | `HX201_BLE_LOCKER` | `ahz7wpy9` |
+
+Check the Tuya `product_id` as well as the retail model when comparing devices. A Product ID identifies the product profile; the **Device ID** requested during setup identifies your individual device. Compatibility requirements and limitations are listed below.
+
 ## Compatibility
 
 This is a custom integration for the **HX201-style DP61 remote-unlock protocol**, not a universal driver for every Tuya lock. The underlying command was verified on an HX201-family lock through a gateway using LAN protocol 3.5. Protocols 3.3 and 3.4 are accepted but require hardware verification on your gateway.
