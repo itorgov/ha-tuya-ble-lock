@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import os
 import re
 import select
 import time
@@ -24,6 +25,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import tinytuya
+from tinytuya.core import header as tuya_header
+from tinytuya.core.exceptions import DecodeError
+from tinytuya.core.message_helper import MessagePayload, TuyaMessage, pack_message
 
 PINNED_TINYTUYA = "1.20.0"
 CONNECTION_TIMEOUT = 2.0
@@ -72,6 +76,43 @@ for _module in (
     "message_helper",
 ):
     logging.getLogger(f"tinytuya.core.{_module}").addFilter(_FILTER)
+
+
+class _GatewayDevice(tinytuya.Device):
+    """Apply transport security fixes only to this integration's connections."""
+
+    def _encode_message(self, msg: MessagePayload) -> bytes:
+        # A child must share the gateway's session key and sequence counter.
+        if self.parent:
+            return self.parent._encode_message(msg)
+        if self.version < 3.5:
+            return super()._encode_message(msg)
+
+        payload = msg.payload
+        if msg.cmd not in tuya_header.NO_PROTOCOL_HEADER_CMDS:
+            payload = self.version_header + payload
+        # TinyTuya 1.20.0 selects a fixed GCM IV when debug logging is enabled.
+        # Supply our own random IV, including for session negotiation frames.
+        message = TuyaMessage(
+            self.seqno,
+            msg.cmd,
+            None,
+            payload,
+            0,
+            True,
+            tuya_header.PREFIX_6699_VALUE,
+            os.urandom(12),
+        )
+        self.seqno += 1
+        return pack_message(message, hmac_key=self.local_key)
+
+    def _receive(self) -> TuyaMessage:
+        message = super()._receive()
+        # The pinned vendor rejects bad GCM tags, but returns bad CRC/HMAC
+        # frames. Reject those before handshake or application processing.
+        if not message.crc_good:
+            raise DecodeError("LAN frame integrity verification failed.")
+        return message
 
 
 class LocalError(Exception):
@@ -249,6 +290,7 @@ class GatewayClient:
         self._gateway: Any | None = None
         self._topology_cache: Topology | None = None
         self._locks: dict[str, LockConfig] = {}
+        self._poll_cursor = 0
         self._statuses: dict[str, LockStatus] = {}
         self._observations: dict[str, _ObservationCounters] = {}
         self._diagnostic_order: list[str] = []
@@ -303,7 +345,7 @@ class GatewayClient:
             _PRIVATE_OPERATION.reset(token)
 
     def _new_gateway(self) -> Any:
-        gateway = tinytuya.Device(
+        gateway = _GatewayDevice(
             self._gateway_id,
             self._host,
             self._local_key,
@@ -344,6 +386,7 @@ class GatewayClient:
     def _disconnect(self) -> None:
         gateway, self._gateway = self._gateway, None
         self._topology_cache = None
+        self._poll_cursor = 0
         self._close_gateway(gateway)
         statuses = {node_id: LockStatus(False) for node_id in self._locks}
         if statuses != self._statuses:
@@ -356,6 +399,7 @@ class GatewayClient:
         try:
             gateway, self._gateway = self._gateway, None
             self._topology_cache = None
+            self._poll_cursor = 0
             self._close_gateway(gateway)
             self._locks.clear()
             self._statuses.clear()
@@ -521,6 +565,8 @@ class GatewayClient:
     def poll(self, locks: list[LockConfig]) -> dict[str, LockStatus]:
         """Initialize session topology once, then request optional child status."""
         with self._operation():
+            if list(self._locks) != [lock.node_id for lock in locks]:
+                self._poll_cursor = 0
             self._locks = {lock.node_id: lock for lock in locks}
             self._diagnostic_order = list(self._locks)
             self._diagnostic_sources = {
@@ -543,7 +589,12 @@ class GatewayClient:
             gateway = self._connect()
             self._session_topology(gateway)
             deadline = time.monotonic() + STATUS_TIMEOUT
-            for lock in locks:
+            # Continue where the previous bounded batch stopped, so slow
+            # preparation or scheduling cannot indefinitely skip later locks.
+            start = self._poll_cursor
+            for offset in range(len(locks)):
+                index = (start + offset) % len(locks)
+                lock = locks[index]
                 if not self._statuses[lock.node_id].online:
                     continue
                 if time.monotonic() >= deadline:
@@ -553,6 +604,7 @@ class GatewayClient:
                 gateway.socket.settimeout(max(0.001, deadline - time.monotonic()))
                 if child._send_receive_quick(payload, recv_retries=0) is not True:
                     raise CannotConnect("Could not request the lock status.")
+                self._poll_cursor = (index + 1) % len(locks)
             for response in self._read_decoded(gateway, deadline):
                 self._handle_response(response)
             return dict(self._statuses)

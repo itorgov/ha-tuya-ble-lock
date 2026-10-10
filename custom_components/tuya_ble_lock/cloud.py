@@ -244,12 +244,6 @@ async def async_discover_gateway(
         if device_id == gateway_id or device_id in seen_devices:
             raise CloudError("Tuya returned conflicting child device IDs")
         seen_devices.add(device_id)
-        display_metadata = child
-        if not _text(child.get("name"), "") or _product_id(child.get("product_id")) is None:
-            details = await client.get(f"/v1.1/iot-03/devices/{device_id}")
-            if not isinstance(details, dict) or details.get("id") != device_id:
-                raise CloudError("Tuya did not return the selected child")
-            display_metadata = {**child, **details}
         node_id = child.get("node_id")
         if not isinstance(node_id, str) or not _NODE_ID.fullmatch(node_id):
             node_id = ""
@@ -258,8 +252,28 @@ async def async_discover_gateway(
             raise CloudError("Tuya returned conflicting child node IDs")
         else:
             seen_nodes.add(node_id)
-            specification = await client.get(f"/v1.1/devices/{device_id}/specifications")
-            reason = None if _supports_unlock(specification) else "unsupported_profile"
+            reason = None
+        display_metadata = child
+        if not _text(child.get("name"), "") or _product_id(child.get("product_id")) is None:
+            try:
+                details = await client.get(f"/v1.1/iot-03/devices/{device_id}")
+            except CloudAuthError:
+                raise
+            except CloudError:
+                reason = reason or "metadata_unavailable"
+            else:
+                if not isinstance(details, dict) or details.get("id") != device_id:
+                    raise CloudError("Tuya did not return the selected child")
+                display_metadata = {**child, **details}
+        if reason is None:
+            try:
+                specification = await client.get(f"/v1.1/devices/{device_id}/specifications")
+            except CloudAuthError:
+                raise
+            except CloudError:
+                reason = "specification_unavailable"
+            else:
+                reason = None if _supports_unlock(specification) else "unsupported_profile"
         locks.append(
             DiscoveredLock(
                 device_id=device_id,

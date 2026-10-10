@@ -240,6 +240,96 @@ async def test_other_children_are_not_automatically_classified_as_supported_lock
     assert result.locks[0].unsupported_reason == "unsupported_profile"
 
 
+@pytest.mark.parametrize("stage", ["metadata", "specification"])
+@pytest.mark.parametrize("failure", ["http", "api", "network"])
+async def test_child_lookup_failure_preserves_verified_siblings(stage, failure):
+    """A stale child cannot prevent setup of verified locks on the same gateway."""
+    failed_child = child(id="unverified-child", node_id="secondnode")
+    if stage == "metadata":
+        failed_child["name"] = None
+    failed_response = {
+        "http": response(status=500),
+        "api": response(payload={"success": False, "code": "unexpected", "msg": "private"}),
+        "network": ClientError("private"),
+    }[failure]
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway()),
+        response([child(), failed_child, child(id="last-lock", node_id="thirdnode")]),
+        response(specification()),
+        failed_response,
+        response(specification()),
+    )
+
+    result = await discover(session)
+
+    assert result.local_key == "0123456789abcdef"
+    assert [(lock.device_id, lock.node_id, lock.supported) for lock in result.locks] == [
+        ("lock-example", "abcdef012345", True),
+        ("unverified-child", "secondnode", False),
+        ("last-lock", "thirdnode", True),
+    ]
+    assert result.locks[1].unsupported_reason == f"{stage}_unavailable"
+    expected_path = (
+        "/v1.1/iot-03/devices/unverified-child"
+        if stage == "metadata"
+        else "/v1.1/devices/unverified-child/specifications"
+    )
+    assert session.get.call_args_list[4].args[0].endswith(expected_path)
+    assert session.get.call_args_list[5].args[0].endswith("/last-lock/specifications")
+    assert session.get.call_count == 6
+
+
+@pytest.mark.parametrize("stage", ["metadata", "specification"])
+@pytest.mark.parametrize("failure", ["http", "api"])
+async def test_child_auth_failure_still_aborts_discovery(stage, failure):
+    """Expired credentials or denied API permission apply to the whole discovery."""
+    selected_child = child(name=None) if stage == "metadata" else child()
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway()),
+        response([selected_child, child(id="last-lock", node_id="thirdnode")]),
+        response(status=403)
+        if failure == "http"
+        else response(payload={"success": False, "code": 1010, "msg": "private"}),
+    )
+
+    with pytest.raises(cloud.CloudAuthError):
+        await discover(session)
+
+    assert session.get.call_count == 4
+
+
+@pytest.mark.parametrize("stage", ["gateway", "topology"])
+async def test_gateway_and_topology_lookup_failures_still_abort(stage):
+    """Partial child recovery requires a verified gateway and child inventory."""
+    responses = [response({"access_token": "test-token"})]
+    if stage == "topology":
+        responses.append(response(gateway()))
+    responses.append(response(status=500))
+    session = session_with(*responses)
+
+    with pytest.raises(cloud.CloudError):
+        await discover(session)
+
+    assert session.get.call_count == len(responses)
+
+
+async def test_unverified_child_cannot_hide_a_conflicting_node_id():
+    """A failed optional lookup must not bypass routing identity validation."""
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway()),
+        response([child(name=None), child(id="different-lock")]),
+        response(status=500),
+    )
+
+    with pytest.raises(cloud.CloudError, match="conflicting child node IDs"):
+        await discover(session)
+
+    assert session.get.call_count == 4
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "children",

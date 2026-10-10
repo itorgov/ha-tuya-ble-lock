@@ -637,9 +637,24 @@ async def test_duplicate_lock_cannot_be_added_under_another_gateway(hass):
     assert result["errors"] == {"base": "duplicate_lock"}
 
 
-@pytest.mark.parametrize("clear_code", [False, True])
+@pytest.mark.parametrize(
+    "clear_code,extra_input",
+    [
+        (False, {}),
+        (True, {}),
+        (
+            True,
+            {
+                CONF_PAYLOAD: base64.b64encode(b"\x01\x00\x02" + b"87654321\x00\x00").decode(),
+                CONF_REMOTE_CODE: "87654321",
+            },
+        ),
+        (True, {CONF_PAYLOAD: "not-valid-base64", CONF_REMOTE_CODE: "invalid"}),
+    ],
+    ids=["preserve", "clear", "clear-overrides-valid-import", "clear-ignores-invalid-import"],
+)
 async def test_reconfigure_preserves_or_explicitly_clears_existing_code(
-    hass, monkeypatch, clear_code
+    hass, monkeypatch, flow_mocks, clear_code, extra_input
 ):
     config_entry = entry(hass)
     monkeypatch.setattr(hass.config_entries, "async_reload", AsyncMock(return_value=True))
@@ -662,13 +677,24 @@ async def test_reconfigure_preserves_or_explicitly_clears_existing_code(
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_NAME: LOCK[CONF_NAME], CONF_PROFILE: True, CONF_MEMBER: 1, "clear_code": clear_code},
+        {
+            CONF_NAME: LOCK[CONF_NAME],
+            CONF_PROFILE: True,
+            CONF_MEMBER: 1,
+            "clear_code": clear_code,
+            **extra_input,
+        },
     )
+    assert result["step_id"] == "manage"
     # Reconfiguration is transactional until the user selects Save.
     assert config_entry.data[CONF_LOCKS][0][CONF_REMOTE_CODE] == LOCK[CONF_REMOTE_CODE]
     await hass.config_entries.flow.async_configure(result["flow_id"], {"next_step_id": "finish"})
     expected = None if clear_code else LOCK[CONF_REMOTE_CODE]
     assert config_entry.data[CONF_LOCKS][0][CONF_REMOTE_CODE] == expected
+    assert config_entry.data[CONF_LOCKS][0][CONF_MEMBER] == 1
+    assert CONF_PAYLOAD not in config_entry.data[CONF_LOCKS][0]
+    assert "clear_code" not in config_entry.data[CONF_LOCKS][0]
+    flow_mocks.unlock.assert_not_called()
 
 
 async def test_reconfigure_can_remove_last_lock(hass, monkeypatch):

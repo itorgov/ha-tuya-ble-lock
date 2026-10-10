@@ -39,7 +39,7 @@
       },
       "no_locks": {
         "title": "No new compatible locks found",
-        "description": "No unconfigured child has the required writable raw DP61 signature. Check cloud API permissions, gateway pairing and compatibility. You may enter a known supported lock manually.",
+        "description": "No new child could be verified as the supported writable raw DP61 profile. Some device metadata may be unavailable. Check cloud API permissions, gateway pairing and compatibility. You may enter a known supported lock manually.",
         "data": {}
       },
       "manage": {

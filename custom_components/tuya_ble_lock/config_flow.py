@@ -104,7 +104,7 @@ def _credentials(data: dict[str, Any], previous: dict[str, Any]) -> dict[str, An
     code = data.get(CONF_REMOTE_CODE) or previous.get(CONF_REMOTE_CODE)
     if data.get("clear_code"):
         code = None
-    if payload := data.get(CONF_PAYLOAD):
+    if not data.get("clear_code") and (payload := data.get(CONF_PAYLOAD)):
         try:
             raw = base64.b64decode(payload, validate=True)
             if len(raw) != 13 or raw[0] != 1 or raw[-2:] != b"\x00\x00":

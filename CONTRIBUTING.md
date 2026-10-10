@@ -16,7 +16,7 @@ Tests block network sockets and use synthetic devices and credentials. Do not pu
 ## Design
 
 - `cloud.py` is a temporary, read-only OpenAPI client for setup. It does not persist project credentials or participate in runtime control.
-- `local.py` owns gateway transport and protocol parsing independently of Home Assistant. TinyTuya is pinned because the at-most-once write path uses its private transport API. Review that implementation and the send-count tests before changing the pin.
+- `local.py` owns gateway transport and protocol parsing independently of Home Assistant. TinyTuya is pinned because the at-most-once write path uses its private transport API. The integration's gateway subclass validates incoming frame integrity and supplies fresh GCM nonces even when vendor debug logging is enabled. Review the framing, integrity, nonce, and send-count tests before changing the pin.
 - `coordinator.py` serializes all gateway operations in the executor, including during cancellation and unload. One persistent connection serves every configured lock, publishing incoming state transitions and performing periodic status refreshes.
 - `config_flow.py` uses Home Assistant's current schemas, secret fields, selectors, unique gateway IDs, reconfiguration and options flow. Persistent settings are local connection details and explicit lock configurations.
 - Entities use stable IDs and the device registry's current `via_device_id` API. Diagnostics allowlist aggregate values and anonymous per-lock observations: numeric DP IDs and report counts, without raw payloads or identifiers.

@@ -153,6 +153,55 @@ async def test_initial_failure_retries_setup(hass, entry_data, mock_gateway):
     mock_gateway["close"].assert_called_once()
 
 
+async def test_diagnostics_after_failed_setup_does_not_retry_gateway(
+    hass, entry_data, mock_gateway
+):
+    """A setup-retry entry still supplies credential-free troubleshooting data."""
+    entry = MockConfigEntry(domain=DOMAIN, data=entry_data, unique_id="test_gateway")
+    entry.add_to_hass(hass)
+    mock_gateway["poll"].side_effect = CannotConnect("private-vendor-value")
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert not hasattr(entry, "runtime_data")
+    call_counts = {name: job.call_count for name, job in mock_gateway.items()}
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert diagnostics == {
+        "setup_state": "setup_retry",
+        "protocol_version": "3.5",
+        "scan_interval": 60,
+        "configured_locks": 1,
+        "gateway_available": False,
+        "online_locks": 0,
+        "locks_with_battery_report": 0,
+        "locks_with_state_report": 0,
+        "transport": None,
+    }
+    assert {name: job.call_count for name, job in mock_gateway.items()} == call_counts
+
+
+async def test_diagnostics_after_unload_does_not_reopen_gateway(hass, entry_data, mock_gateway):
+    """Unloading removes runtime_data without removing diagnostic support."""
+    entry = await setup_entry(hass, entry_data)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert not hasattr(entry, "runtime_data")
+    call_counts = {name: job.call_count for name, job in mock_gateway.items()}
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert diagnostics["setup_state"] == "not_loaded"
+    assert diagnostics["configured_locks"] == 1
+    assert diagnostics["gateway_available"] is False
+    assert diagnostics["online_locks"] == 0
+    assert diagnostics["locks_with_battery_report"] == 0
+    assert diagnostics["locks_with_state_report"] == 0
+    assert diagnostics["transport"] is None
+    assert {name: job.call_count for name, job in mock_gateway.items()} == call_counts
+
+
 async def test_remove_child_cleans_registry_without_affecting_gateway(
     hass, entry_data, mock_gateway
 ):

@@ -78,6 +78,7 @@ def devices(monkeypatch):
     )
     factory = Mock(side_effect=lambda *args, **kwargs: child if "parent" in kwargs else gateway)
     monkeypatch.setattr(local.tinytuya, "Device", factory)
+    monkeypatch.setattr(local, "_GatewayDevice", factory)
     monkeypatch.setattr(
         local.select,
         "select",
@@ -325,6 +326,49 @@ def test_multi_child_exact_identity_and_partial_reports(client, devices, lock_co
     }
     gateway.status_reports = [report(**{"62": "unused"})]
     assert client.poll(locks)["node_example"] == local.LockStatus(True, 63, True)
+    gateway.close.assert_not_called()
+
+
+def test_bounded_poll_resumes_with_remaining_locks_and_preserves_state(client, devices):
+    gateway, child, _ = devices
+    locks = [local.LockConfig(f"lock_{i}", f"node_{i}", f"Example {i}") for i in range(4)]
+    gateway.topology["data"] = {"online": [lock.node_id for lock in locks]}
+    gateway.status_reports = [
+        {"cid": lock.node_id, "dps": {"8": 60 + index, "47": False}}
+        for index, lock in enumerate(locks)
+    ]
+    expected = client.poll(locks)
+    topology = client._topology_cache
+    gateway.status_reports = []
+    child._send_receive_quick.reset_mock()
+    clock = [100.0]
+    queried = []
+    original_child = client._child
+
+    def slow_child(gateway, lock):
+        # Model executor scheduling/CPU delay before an otherwise immediate
+        # send. The aggregate two-second budget permits three of four nodes.
+        clock[0] += 0.7
+        queried.append(lock.node_id)
+        return original_child(gateway, lock)
+
+    with (
+        patch.object(local.time, "monotonic", side_effect=lambda: clock[0]),
+        patch.object(client, "_child", side_effect=slow_child),
+    ):
+        assert client.poll(locks) == expected
+        assert queried == ["node_0", "node_1", "node_2"]
+        queried.clear()
+        assert client.poll(locks) == expected
+        assert queried == ["node_3", "node_0", "node_1"]
+        queried.clear()
+        assert client.poll(list(reversed(locks))) == expected
+        assert queried == ["node_3", "node_2", "node_1"]
+    assert client._topology_cache is topology
+    assert all(
+        call.args[0][0] == tinytuya.DP_QUERY for call in child._send_receive_quick.call_args_list
+    )
+    gateway._get_socket.assert_called_once_with(False)
     gateway.close.assert_not_called()
 
 
