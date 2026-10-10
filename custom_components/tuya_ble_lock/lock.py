@@ -8,7 +8,7 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import TuyaBLELockConfigEntry
-from .const import DOMAIN
+from .const import DOMAIN, EVENT_TUYA_BLE_LOCK
 from .coordinator import GatewayCoordinator
 from .entity import TuyaLockEntity
 from .local import LockConfig
@@ -26,10 +26,9 @@ async def async_setup_entry(
 
 
 class TuyaBLELock(TuyaLockEntity, LockEntity):
-    """An unlock-only lock with deliberately unknown physical state."""
+    """An unlock-only lock whose state follows reports from the gateway."""
 
     _attr_name = None
-    _attr_is_locked = None
     _attr_supported_features = 0
 
     def __init__(self, coordinator: GatewayCoordinator, lock: LockConfig) -> None:
@@ -37,11 +36,20 @@ class TuyaBLELock(TuyaLockEntity, LockEntity):
         super().__init__(coordinator, lock)
         self._attr_unique_id = lock.device_id
 
+    @property
+    def is_locked(self) -> bool | None:
+        """Return the reported state, unknown until a valid report arrives."""
+        return self.lock_status.is_locked if self.lock_status else None
+
     async def async_unlock(self, **kwargs: Any) -> None:
         """Use an existing code; never register a new key or retry a write."""
+        context = self._context
         await self._async_unlock(kwargs.get("code"))
-        # A later matching DP61 report is not proof of physical movement.
-        # Leave state unknown, including for locks that automatically relock.
+        # Only state reports update is_locked; an acknowledgement is not state.
+        event_data = {"entity_id": self.entity_id, "type": "unlock_acknowledged"}
+        if self.device_entry is not None:
+            event_data["device_id"] = self.device_entry.id
+        self.hass.bus.async_fire(EVENT_TUYA_BLE_LOCK, event_data, context=context)
 
     async def async_lock(self, **kwargs: Any) -> None:
         """Explain why locking is unavailable instead of inventing a DP write."""

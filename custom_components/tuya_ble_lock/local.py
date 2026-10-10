@@ -1,8 +1,8 @@
 """Synchronous, credential-safe LAN transport for the supported DP61 lock profile.
 
 All methods belong in Home Assistant's executor and must be serialized by the
-caller. Every operation opens its own session. Unlock sends one control packet
-at most; a later matching response does not establish physical lock state.
+caller. One persistent session receives device reports between commands. Unlock
+sends one control packet at most; its acknowledgement is never a physical state.
 """
 
 # Sanitize every vendor exception at this credential boundary; deliberately do
@@ -17,10 +17,10 @@ import logging
 import re
 import select
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import tinytuya
@@ -30,6 +30,25 @@ CONNECTION_TIMEOUT = 2.0
 STATUS_TIMEOUT = 2.0
 UNLOCK_TIMEOUT = 6.0
 MAX_FRAMES = 64
+LISTEN_TIMEOUT = 1.0
+HEARTBEAT_INTERVAL = 10.0
+HEARTBEAT_TIMEOUT = 30.0
+MAX_DIAGNOSTIC_COUNT = 2_147_483_647
+_DIAGNOSTIC_COUNTERS = (
+    "dp8_report_count",
+    "dp8_valid_count",
+    "dp8_invalid_count",
+    "dp47_report_count",
+    "dp47_valid_count",
+    "dp47_invalid_count",
+    "dp47_locked_count",
+    "dp47_unlocked_count",
+    "dp40_report_count",
+    "dp40_open_count",
+    "dp40_closed_count",
+    "dp40_unknown_count",
+    "dp40_invalid_count",
+)
 
 _PRIVATE_OPERATION: ContextVar[bool] = ContextVar("tuya_ble_lock_private", default=False)
 
@@ -81,7 +100,7 @@ class UnlockRejected(UnlockError):
 
 @dataclass(frozen=True)
 class Topology:
-    """Nodes observed in one fresh gateway topology report."""
+    """Nodes observed in one complete gateway topology report."""
 
     online: frozenset[str]
     offline: frozenset[str]
@@ -96,14 +115,57 @@ class LockConfig:
     name: str
     remote_unlock_code: str | None = None
     member: int = 1
+    state_source: str = "motor_dp47"
 
 
 @dataclass(frozen=True)
 class LockStatus:
-    """Fresh connectivity and optional battery; never an inferred lock state."""
+    """Connectivity and the last values reported on the current connection."""
 
     online: bool
     battery: int | None = None
+    is_locked: bool | None = None
+
+
+@dataclass
+class _ObservationCounters:
+    """Bounded protocol observations; never retain raw datapoint values."""
+
+    dp_ids: set[int] = field(default_factory=set)
+    counts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(_DIAGNOSTIC_COUNTERS, 0))
+
+    def increment(self, key: str) -> None:
+        self.counts[key] = min(self.counts[key] + 1, MAX_DIAGNOSTIC_COUNT)
+
+    def observe(self, dps: dict[str, Any]) -> None:
+        for dp_id in dps:
+            if re.fullmatch(r"[1-9][0-9]{0,2}", dp_id) and int(dp_id) <= 255:
+                self.dp_ids.add(int(dp_id))
+        if "8" in dps:
+            self.increment("dp8_report_count")
+            value = dps["8"]
+            valid = type(value) is int and 0 <= value <= 100
+            self.increment("dp8_valid_count" if valid else "dp8_invalid_count")
+        if "47" in dps:
+            self.increment("dp47_report_count")
+            value = dps["47"]
+            if type(value) is bool:
+                self.increment("dp47_valid_count")
+                self.increment("dp47_unlocked_count" if value else "dp47_locked_count")
+            else:
+                self.increment("dp47_invalid_count")
+        if "40" in dps:
+            self.increment("dp40_report_count")
+            value = dps["40"]
+            category = (
+                value
+                if type(value) is str and value in ("open", "closed", "unknown")
+                else "invalid"
+            )
+            self.increment(f"dp40_{category}_count")
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"observed_dp_ids": sorted(self.dp_ids), **self.counts}
 
 
 def build_unlock(member: int, code: str | None) -> bytes:
@@ -160,7 +222,7 @@ def _topology(response: object) -> Topology:
 
 
 class GatewayClient:
-    """A single gateway; all public operations close their LAN socket on exit."""
+    """One persistent gateway connection, exclusively owned by its caller."""
 
     def __init__(self, host: str, gateway_id: str, local_key: str, version: float):
         if not isinstance(host, str) or not host.strip() or host in ("Auto", "0.0.0.0"):
@@ -185,78 +247,152 @@ class GatewayClient:
         self._local_key = local_key
         self._version = version
         self._gateway: Any | None = None
+        self._topology_cache: Topology | None = None
+        self._locks: dict[str, LockConfig] = {}
+        self._statuses: dict[str, LockStatus] = {}
+        self._observations: dict[str, _ObservationCounters] = {}
+        self._diagnostic_order: list[str] = []
+        self._diagnostic_sources: dict[str, str] = {}
+        self._connection_count = 0
+        self._received_report_count = 0
+        self._callback: Callable[[dict[str, LockStatus]], None] | None = None
+        self._last_heartbeat = 0.0
+        self._last_received = 0.0
+
+    def set_update_callback(self, callback: Callable[[dict[str, LockStatus]], None] | None) -> None:
+        """Set a thread-safe recipient of sanitized, immutable value snapshots."""
+        self._callback = callback
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return anonymous counters in configured order, without network I/O."""
+        return {
+            "connection_count": self._connection_count,
+            "received_report_count": self._received_report_count,
+            "locks": [
+                {
+                    "state_source": self._diagnostic_sources.get(node_id, "motor_dp47"),
+                    **self._observations.get(node_id, _ObservationCounters()).snapshot(),
+                }
+                for node_id in self._diagnostic_order
+            ],
+        }
+
+    def _notify(self) -> None:
+        if self._callback is not None:
+            self._callback(dict(self._statuses))
+
+    def _set_status(self, node_id: str, status: LockStatus) -> None:
+        if self._statuses.get(node_id) != status:
+            self._statuses[node_id] = status
+            self._notify()
 
     @contextmanager
-    def _session(self) -> Iterator[Any]:
+    def _operation(self) -> Iterator[None]:
         token = _PRIVATE_OPERATION.set(True)
         try:
-            self._gateway = tinytuya.Device(
-                self._gateway_id,
-                self._host,
-                self._local_key,
-                version=self._version,
-                persist=True,
-                connection_timeout=CONNECTION_TIMEOUT,
-                connection_retry_limit=1,
-                connection_retry_delay=0,
-            )
-            self._gateway.disabledetect = True
-            yield self._gateway
+            yield
+        except NodeUnavailable, UnlockRejected:
+            raise
         except LocalError:
+            self._disconnect()
             raise
         except Exception:
-            # Vendor exception messages and object representations can contain
-            # keys, raw DPS or user identifiers. Never expose their content.
+            self._disconnect()
             raise CannotConnect("The local gateway operation failed.") from None
         finally:
-            self.close()
             _PRIVATE_OPERATION.reset(token)
 
-    def close(self) -> None:
-        """Release the current socket, if any; safe to call more than once."""
-        gateway, self._gateway = self._gateway, None
+    def _new_gateway(self) -> Any:
+        gateway = tinytuya.Device(
+            self._gateway_id,
+            self._host,
+            self._local_key,
+            version=self._version,
+            persist=True,
+            connection_timeout=CONNECTION_TIMEOUT,
+            connection_retry_limit=1,
+            connection_retry_delay=0,
+        )
+        gateway.disabledetect = True
+        return gateway
+
+    @staticmethod
+    def _open_gateway(gateway: Any) -> None:
+        if gateway._get_socket(False) is not True:
+            raise CannotConnect("Could not connect to the local gateway.")
+        # Once opened, no helper may reconnect implicitly or replay a command.
+        gateway.set_socketRetryLimit(0)
+
+    def _connect(self) -> Any:
+        if self._gateway is None:
+            self._gateway = self._new_gateway()
+            self._open_gateway(self._gateway)
+            self._connection_count = min(self._connection_count + 1, MAX_DIAGNOSTIC_COUNT)
+            self._last_heartbeat = self._last_received = time.monotonic()
+        if self._gateway.socket is None:
+            raise CannotConnect("The local gateway disconnected.")
+        return self._gateway
+
+    @staticmethod
+    def _close_gateway(gateway: Any | None) -> None:
         if gateway is not None:
             try:
                 gateway.close()
             except Exception:
                 pass
 
-    @staticmethod
-    def _prepare(gateway: Any) -> Topology:
-        """Read-only query before any mutation; do not use TinyTuya caches."""
-        topology = _topology(gateway.subdev_query())
-        if gateway.cmd_retcode not in (None, 0):
-            raise CannotConnect("The gateway rejected the topology query.")
-        # _get_socket cannot reconnect after this point, including if the socket
-        # disappears between the identity check and the single control send.
-        gateway.set_socketRetryLimit(0)
-        return topology
+    def _disconnect(self) -> None:
+        gateway, self._gateway = self._gateway, None
+        self._topology_cache = None
+        self._close_gateway(gateway)
+        statuses = {node_id: LockStatus(False) for node_id in self._locks}
+        if statuses != self._statuses:
+            self._statuses = statuses
+            self._notify()
 
-    def probe(self) -> Topology:
-        """Discover node connectivity using only a read-only topology query."""
-        with self._session() as gateway:
-            return self._prepare(gateway)
+    def close(self) -> None:
+        """Release the connection and clear cached observations without callbacks."""
+        token = _PRIVATE_OPERATION.set(True)
+        try:
+            gateway, self._gateway = self._gateway, None
+            self._topology_cache = None
+            self._close_gateway(gateway)
+            self._locks.clear()
+            self._statuses.clear()
+        finally:
+            _PRIVATE_OPERATION.reset(token)
 
     @staticmethod
-    def _read_decoded(gateway: Any, deadline: float) -> Iterator[dict[str, Any]]:
+    def _read_decoded(
+        gateway: Any, deadline: float, *, idle_timeout: float | None = None
+    ) -> Iterator[dict[str, Any]]:
+        """Wait before reading so idle timeouts cannot damage partial framing."""
         for _ in range(MAX_FRAMES):
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or gateway.socket is None:
+            if remaining <= 0:
                 return
-            gateway.socket.settimeout(remaining)
+            if gateway.socket is None:
+                raise CannotConnect("The local gateway disconnected.")
             try:
+                wait = remaining if idle_timeout is None else min(remaining, idle_timeout)
+                readable, _, _ = select.select([gateway.socket], [], [], wait)
+                if not readable:
+                    return
+                gateway.socket.settimeout(max(0.001, deadline - time.monotonic()))
                 message = gateway._receive()
-            except OSError, ValueError:
-                # A timeout can split a frame. Do not resume that connection's
-                # framing or retry a previously sent command.
-                return
             except Exception:
-                raise LocalError("Could not decode a LAN response.") from None
+                # _receive has no resumable frame buffer. An interrupted frame
+                # invalidates this connection, even when the cause is a timeout.
+                raise CannotConnect("The local gateway response was interrupted.") from None
             if not message:
-                return
+                raise CannotConnect("The local gateway disconnected.")
+            # Some BLE gateways explicitly reject this optional read operation.
             if getattr(message, "retcode", 0) not in (None, 0):
+                if getattr(message, "cmd", None) in (tinytuya.DP_QUERY, tinytuya.DP_QUERY_NEW):
+                    continue
                 raise LocalError("The gateway returned a nonzero protocol result.")
             if not message.payload:
+                yield {}
                 continue
             try:
                 response = gateway._decode_payload(message.payload)
@@ -264,87 +400,207 @@ class GatewayClient:
                 raise LocalError("Could not decode a LAN response.") from None
             if isinstance(response, dict):
                 yield response
+        # A bounded batch must not leave an old ACK or topology queued behind
+        # it before a fresh command. Fail closed if the input is still busy.
+        try:
+            readable, _, _ = select.select([gateway.socket], [], [], 0)
+        except Exception:
+            raise CannotConnect("Could not inspect the gateway connection.") from None
+        if readable:
+            raise CannotConnect("Too many queued gateway responses.")
+
+    def _apply_topology(self, topology: Topology) -> None:
+        self._topology_cache = topology
+        for node_id in self._locks:
+            previous = self._statuses.get(node_id, LockStatus(False))
+            self._set_status(
+                node_id,
+                (
+                    LockStatus(True, previous.battery, previous.is_locked)
+                    if node_id in topology.online
+                    else LockStatus(False)
+                ),
+            )
+
+    def _handle_response(self, response: dict[str, Any]) -> None:
+        self._last_received = time.monotonic()
+        if response:
+            self._received_report_count = min(self._received_report_count + 1, MAX_DIAGNOSTIC_COUNT)
+        if response.get("reqType") == "subdev_online_stat_report":
+            self._apply_topology(_topology(response))
+            return
+        for node_id, lock in self._locks.items():
+            dps = matching_dps(response, node_id)
+            if dps is None:
+                continue
+            self._observations.setdefault(node_id, _ObservationCounters()).observe(dps)
+            previous = self._statuses.get(node_id, LockStatus(False))
+            battery, locked = previous.battery, previous.is_locked
+            if "8" in dps:
+                value = dps["8"]
+                battery = value if type(value) is int and 0 <= value <= 100 else None
+            # HX201 firmware reports its latch through DP40. Other profiles use
+            # motor DP47; never infer physical state from the DP61 acknowledgement.
+            if lock.state_source == "hx201_dp40" and "40" in dps:
+                value = dps["40"]
+                locked = value == "closed" if value in ("open", "closed") else None
+            elif lock.state_source == "motor_dp47" and "47" in dps:
+                value = dps["47"]
+                locked = not value if type(value) is bool else None
+            self._set_status(node_id, LockStatus(True, battery, locked))
+
+    def _drain(self, gateway: Any, *, apply: bool = True) -> None:
+        """Process queued reports before sending; never consume them as command ACKs."""
+        for response in self._read_decoded(
+            gateway, time.monotonic() + CONNECTION_TIMEOUT, idle_timeout=0.05
+        ):
+            if apply:
+                self._handle_response(response)
+        try:
+            readable, _, _ = select.select([gateway.socket], [], [], 0)
+        except Exception:
+            raise CannotConnect("Could not inspect the gateway connection.") from None
+        if readable:
+            raise CannotConnect("Could not drain queued gateway responses before sending.")
+
+    def _query_topology(self, gateway: Any, *, apply: bool = True) -> Topology:
+        self._drain(gateway, apply=apply)
+        payload = gateway.generate_payload(
+            tinytuya.LAN_EXT_STREAM,
+            rawData={"cids": []},
+            reqType="subdev_online_stat_query",
+        )
+        if gateway._send_receive_quick(payload, recv_retries=0) is not True:
+            raise CannotConnect("Could not query the gateway topology.")
+        for response in self._read_decoded(gateway, time.monotonic() + CONNECTION_TIMEOUT):
+            if apply:
+                self._handle_response(response)
+            if response.get("reqType") == "subdev_online_stat_report":
+                return _topology(response)
+        raise CannotConnect("The gateway did not return a fresh subdevice topology report.")
+
+    def _session_topology(self, gateway: Any) -> Topology:
+        """Subscribe once; repeated LAN64 queries can stall some BLE gateways."""
+        if self._topology_cache is None:
+            return self._query_topology(gateway)
+        self._drain(gateway)
+        return self._topology_cache
+
+    def probe(self) -> Topology:
+        """Run a temporary read-only query without changing the live connection."""
+        token = _PRIVATE_OPERATION.set(True)
+        gateway = None
+        try:
+            gateway = self._new_gateway()
+            self._open_gateway(gateway)
+            return self._query_topology(gateway, apply=False)
+        except LocalError:
+            raise
+        except Exception:
+            raise CannotConnect("The local gateway operation failed.") from None
+        finally:
+            self._close_gateway(gateway)
+            _PRIVATE_OPERATION.reset(token)
+
+    def probe_live(self) -> Topology:
+        """Reconnect for fresh discovery, then restore configured child status."""
+        with self._operation():
+            locks = list(self._locks.values())
+            self._disconnect()
+            if locks:
+                self.poll(locks)
+                assert self._topology_cache is not None
+                return self._topology_cache
+            return self._session_topology(self._connect())
+
+    def _child(self, gateway: Any, lock: LockConfig) -> Any:
+        child = tinytuya.Device(lock.device_id, cid=lock.node_id, parent=gateway)
+        child.disabledetect = True
+        return child
 
     def poll(self, locks: list[LockConfig]) -> dict[str, LockStatus]:
-        """Read topology and optional battery with one shared child-query budget.
-
-        BLE gateways can reject DP_QUERY while supporting topology and unlock.
-        Missing or partial DPS therefore never invalidate a topology report.
-        """
-        with self._session() as gateway:
-            topology = self._prepare(gateway)
-            statuses = {
-                lock.node_id: LockStatus(online=lock.node_id in topology.online) for lock in locks
+        """Initialize session topology once, then request optional child status."""
+        with self._operation():
+            self._locks = {lock.node_id: lock for lock in locks}
+            self._diagnostic_order = list(self._locks)
+            self._diagnostic_sources = {
+                lock.node_id: (
+                    lock.state_source
+                    if lock.state_source in ("motor_dp47", "hx201_dp40")
+                    else "unsupported"
+                )
+                for lock in locks
             }
-            if not any(status.online for status in statuses.values()):
-                return statuses
+            self._statuses = {
+                node_id: self._statuses.get(
+                    node_id,
+                    LockStatus(
+                        self._topology_cache is not None and node_id in self._topology_cache.online
+                    ),
+                )
+                for node_id in self._locks
+            }
+            gateway = self._connect()
+            self._session_topology(gateway)
             deadline = time.monotonic() + STATUS_TIMEOUT
-            try:
-                for lock in locks:
-                    if not statuses[lock.node_id].online:
-                        continue
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0 or gateway.socket is None:
-                        break
-                    gateway.socket.settimeout(min(0.25, remaining))
-                    child = tinytuya.Device(lock.device_id, cid=lock.node_id, parent=gateway)
-                    child.disabledetect = True
-                    payload = child.generate_payload(tinytuya.DP_QUERY)
-                    if child._send_receive_quick(payload, recv_retries=0) is not True:
-                        break
-                for response in self._read_decoded(gateway, deadline):
-                    for node_id, status in statuses.items():
-                        dps = matching_dps(response, node_id) if status.online else None
-                        battery = dps.get("8") if dps is not None else None
-                        if type(battery) is int and 0 <= battery <= 100:
-                            statuses[node_id] = LockStatus(online=True, battery=battery)
-            except Exception:
-                # Optional status is deliberately best effort; raw response data
-                # and vendor exceptions must not escape into logs or entities.
-                pass
-            return statuses
-
-    @staticmethod
-    def _drain_before_write(gateway: Any) -> None:
-        if gateway.socket is None:
-            raise UnlockError("The gateway disconnected before unlock; no command was sent.")
-        deadline = time.monotonic() + CONNECTION_TIMEOUT
-        for _ in range(MAX_FRAMES):
-            try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+            for lock in locks:
+                if not self._statuses[lock.node_id].online:
+                    continue
+                if time.monotonic() >= deadline:
                     break
-                readable, _, _ = select.select([gateway.socket], [], [], 0.05)
-                if not readable:
-                    return
-                gateway.socket.settimeout(remaining)
-                if not gateway._receive():
-                    raise OSError
-            except Exception:
-                raise UnlockError(
-                    "Could not clear old LAN responses; no unlock was sent."
-                ) from None
-        raise UnlockError("Too many queued responses; no unlock was sent.")
+                child = self._child(gateway, lock)
+                payload = child.generate_payload(tinytuya.DP_QUERY)
+                gateway.socket.settimeout(max(0.001, deadline - time.monotonic()))
+                if child._send_receive_quick(payload, recv_retries=0) is not True:
+                    raise CannotConnect("Could not request the lock status.")
+            for response in self._read_decoded(gateway, deadline):
+                self._handle_response(response)
+            return dict(self._statuses)
+
+    def listen(self) -> None:
+        """Receive live transitions with bounded waiting; never reconnect here."""
+        with self._operation():
+            gateway = self._gateway
+            if gateway is None or gateway.socket is None:
+                raise CannotConnect("The local gateway is not connected.")
+            now = time.monotonic()
+            if now - self._last_received >= HEARTBEAT_TIMEOUT:
+                raise CannotConnect("The local gateway stopped responding.")
+            if now - self._last_heartbeat >= HEARTBEAT_INTERVAL:
+                gateway.socket.settimeout(LISTEN_TIMEOUT)
+                payload = gateway.generate_payload(tinytuya.HEART_BEAT)
+                if gateway._send_receive_quick(payload, recv_retries=0) is not True:
+                    raise CannotConnect("Could not send the gateway heartbeat.")
+                self._last_heartbeat = now
+            for response in self._read_decoded(gateway, time.monotonic() + LISTEN_TIMEOUT):
+                self._handle_response(response)
 
     def unlock(self, lock: LockConfig) -> None:
-        """Send DP61 once after a fresh topology report for the exact child.
-
-        Returning means a matching DP61 response was observed after the send.
-        It establishes neither response correlation nor physical actuation.
-        The caller must keep physical lock state unknown.
-        """
+        """Send DP61 exactly once, while continuing to process physical reports."""
         raw = build_unlock(lock.member, lock.remote_unlock_code)
         if not lock.node_id or not lock.device_id or lock.device_id == self._gateway_id:
             raise UnlockError("The configured child identity is invalid; no unlock was sent.")
-        with self._session() as gateway:
-            topology = self._prepare(gateway)
-            if lock.node_id not in topology.online or lock.node_id in topology.offline:
+        with self._operation():
+            self._locks[lock.node_id] = lock
+            if lock.node_id not in self._diagnostic_order:
+                self._diagnostic_order.append(lock.node_id)
+            self._diagnostic_sources[lock.node_id] = (
+                lock.state_source
+                if lock.state_source in ("motor_dp47", "hx201_dp40")
+                else "unsupported"
+            )
+            gateway = self._connect()
+            self._session_topology(gateway)
+            if not self._statuses.get(lock.node_id, LockStatus(False)).online:
                 raise NodeUnavailable(
                     "The exact configured child is not online; no unlock was sent."
                 )
-            child = tinytuya.Device(lock.device_id, cid=lock.node_id, parent=gateway)
-            child.disabledetect = True
-            self._drain_before_write(gateway)
+            child = self._child(gateway, lock)
+            self._drain(gateway)
+            if gateway.socket is None:
+                raise UnlockError("The gateway disconnected before unlock; no command was sent.")
+            if not self._statuses.get(lock.node_id, LockStatus(False)).online:
+                raise NodeUnavailable("The configured child went offline; no unlock was sent.")
             try:
                 payload = child.generate_payload(
                     tinytuya.CONTROL, {"61": base64.b64encode(raw).decode("ascii")}
@@ -354,8 +610,7 @@ class GatewayClient:
                     "Could not construct the unlock packet; no unlock was sent."
                 ) from None
             try:
-                # The pinned private helper has exactly one sendall and no send
-                # retry. Do not replace it with set_value() or _send_receive().
+                gateway.socket.settimeout(CONNECTION_TIMEOUT)
                 sent = child._send_receive_quick(payload, recv_retries=0)
             except Exception:
                 sent = None
@@ -366,6 +621,7 @@ class GatewayClient:
             expected = b"\x00" + lock.member.to_bytes(2, "big")
             try:
                 for response in self._read_decoded(gateway, time.monotonic() + UNLOCK_TIMEOUT):
+                    self._handle_response(response)
                     dps = matching_dps(response, lock.node_id)
                     if dps is None or "61" not in dps:
                         continue

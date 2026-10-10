@@ -171,13 +171,15 @@ async def test_remove_child_cleans_registry_without_affecting_gateway(
     )
 
 
-async def test_battery_disabled_by_default_and_fresh(hass, entry_data, mock_gateway):
-    """Optional battery never falls back to a stale retained percentage."""
+async def test_battery_enabled_by_default_and_cleared_on_connection_reset(
+    hass, entry_data, mock_gateway
+):
+    """Battery is usable by default and follows the current connection snapshot."""
     entry = await setup_entry(hass, entry_data)
     registry = er.async_get(hass)
     entity_id = registry.async_get_entity_id("sensor", DOMAIN, "test_lock_battery")
-    assert registry.async_get(entity_id).disabled_by is er.RegistryEntryDisabler.INTEGRATION
-    assert hass.states.get(entity_id) is None
+    assert registry.async_get(entity_id).disabled_by is None
+    assert hass.states.get(entity_id).state == "72"
     from custom_components.tuya_ble_lock.sensor import BatterySensor
 
     sensor = BatterySensor(entry.runtime_data, entry.runtime_data.locks[0])

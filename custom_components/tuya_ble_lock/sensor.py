@@ -1,4 +1,4 @@
-"""Optional battery readings from exact-child local status reports."""
+"""Battery readings from exact-child local status reports."""
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.const import PERCENTAGE, EntityCategory
@@ -30,14 +30,13 @@ class BatterySensor(TuyaLockEntity, SensorEntity):
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_entity_registry_enabled_default = False
 
     def __init__(self, coordinator: GatewayCoordinator, lock: LockConfig) -> None:
-        """Initialize the optional battery sensor."""
+        """Initialize the battery sensor."""
         super().__init__(coordinator, lock)
         self._attr_unique_id = f"{lock.device_id}_battery"
 
     @property
     def native_value(self) -> int | None:
-        """Return only a fresh, validated percentage."""
+        """Return the last battery report from the current connection."""
         return self.lock_status.battery if self.lock_status else None

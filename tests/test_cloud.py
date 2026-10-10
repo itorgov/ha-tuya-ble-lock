@@ -49,6 +49,7 @@ def child(**changes):
         "node_id": "abcdef012345",
         "name": "Example lock",
         "product_name": "Example product",
+        "product_id": "example-product",
         **changes,
     }
 
@@ -92,6 +93,7 @@ async def test_discovery_signs_read_only_requests_and_preserves_node_id(monkeypa
     assert result.locks[0].supported is True
     assert result.locks[0].unsupported_reason is None
     assert result.locks[0].product_name == "Example product"
+    assert result.locks[0].product_id == "example-product"
     requests = session.get.call_args_list
     assert [request.args[0] for request in requests] == [
         "https://openapi.tuyaeu.com/v1.0/token?grant_type=1",
@@ -330,6 +332,50 @@ async def test_child_details_must_identify_requested_device(details):
     with pytest.raises(cloud.CloudError):
         await discover(session)
     assert session.get.call_count == 4
+
+
+async def test_named_child_with_missing_product_id_reads_verified_details():
+    """A friendly name is insufficient to select a product-specific state mapping."""
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway()),
+        response([child(product_id=None)]),
+        response(
+            {
+                "id": "lock-example",
+                "name": "Example lock",
+                "product_id": "ahz7wpy9",
+                "product_name": "HX201_BLE_LOCKER",
+                "node_id": "not-used-for-routing",
+                "local_key": "discard-this-secret",
+            }
+        ),
+        response(specification()),
+    )
+    result = await discover(session)
+    lock = result.locks[0]
+    assert lock.product_id == "ahz7wpy9"
+    assert lock.product_name == "HX201_BLE_LOCKER"
+    assert lock.node_id == "abcdef012345"
+    assert lock.supported is True
+    assert not hasattr(lock, "local_key")
+    assert session.get.call_args_list[3].args[0].endswith("/v1.1/iot-03/devices/lock-example")
+
+
+@pytest.mark.parametrize("product_id", [None, 123, {}, "", " ahz7wpy9", "../ahz7wpy9"])
+async def test_malformed_product_metadata_cannot_select_a_known_profile(product_id):
+    """Keep the ordinary state mapping if optional product metadata is unusable."""
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway()),
+        response([child(product_id=product_id)]),
+        response({"id": "lock-example", "product_id": product_id}),
+        response(specification()),
+    )
+    result = await discover(session)
+    assert result.locks[0].product_id is None
+    assert result.locks[0].supported is True
+    assert session.get.call_count == 5
 
 
 @pytest.mark.asyncio

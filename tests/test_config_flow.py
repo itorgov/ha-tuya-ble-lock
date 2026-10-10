@@ -27,8 +27,12 @@ from custom_components.tuya_ble_lock.const import (
     CONF_PAYLOAD,
     CONF_PROFILE,
     CONF_REMOTE_CODE,
+    CONF_STATE_SOURCE,
     CONF_VERSION,
     DOMAIN,
+    HX201_PRODUCT_ID,
+    STATE_SOURCE_HX201_DP40,
+    STATE_SOURCE_MOTOR_DP47,
 )
 from custom_components.tuya_ble_lock.local import LocalError, Topology
 
@@ -47,6 +51,7 @@ LOCK = {
     CONF_NODE_ID: "abcdef012345",
     CONF_MEMBER: 1,
     CONF_REMOTE_CODE: "12345678",
+    CONF_STATE_SOURCE: STATE_SOURCE_MOTOR_DP47,
 }
 CLOUD = {
     "region": "eu",
@@ -139,6 +144,169 @@ async def test_setup_can_leave_unlock_code_unconfigured(hass):
     )
     assert result["data"][CONF_LOCKS][0][CONF_REMOTE_CODE] is None
     await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("state_source", [STATE_SOURCE_MOTOR_DP47, STATE_SOURCE_HX201_DP40])
+async def test_manual_lock_persists_explicit_state_source(hass, state_source):
+    """Manual setup stores the selected state profile independently of unlock credentials."""
+    result = await manual_to_credentials(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: LOCK[CONF_NAME],
+            CONF_PROFILE: True,
+            CONF_MEMBER: 1,
+            CONF_STATE_SOURCE: state_source,
+        },
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
+    )
+    stored = result["data"][CONF_LOCKS][0]
+    assert stored[CONF_STATE_SOURCE] == state_source
+    assert stored[CONF_REMOTE_CODE] is None
+    assert set(stored) == set(LOCK)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize(
+    "product_id,expected_source",
+    [
+        (HX201_PRODUCT_ID, STATE_SOURCE_HX201_DP40),
+        (None, STATE_SOURCE_MOTOR_DP47),
+        ("unknown-product", STATE_SOURCE_MOTOR_DP47),
+        (HX201_PRODUCT_ID.upper(), STATE_SOURCE_MOTOR_DP47),
+    ],
+)
+async def test_cloud_state_source_default_requires_exact_verified_product_id(
+    hass, monkeypatch, product_id, expected_source
+):
+    """Only the known PID selects DP40; a matching marketing name is insufficient."""
+    discovery = GatewayDiscovery(
+        GATEWAY[CONF_GATEWAY_ID],
+        GATEWAY[CONF_NAME],
+        GATEWAY[CONF_LOCAL_KEY],
+        [
+            DiscoveredLock(
+                LOCK[CONF_DEVICE_ID],
+                LOCK[CONF_NODE_ID],
+                LOCK[CONF_NAME],
+                "HX201_BLE_LOCKER",
+                True,
+                product_id=product_id,
+            )
+        ],
+    )
+    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(return_value=discovery))
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {key: GATEWAY[key] for key in (CONF_NAME, CONF_HOST, CONF_VERSION)},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_LOCKS: [LOCK[CONF_DEVICE_ID]]}
+    )
+    form_values = {CONF_NAME: LOCK[CONF_NAME], CONF_PROFILE: True, CONF_MEMBER: 1}
+    assert result["data_schema"](form_values)[CONF_STATE_SOURCE] == expected_source
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], form_values)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
+    )
+    stored = result["data"][CONF_LOCKS][0]
+    assert stored[CONF_STATE_SOURCE] == expected_source
+    assert set(stored) == set(LOCK)
+    assert "product_id" not in stored and "product_name" not in stored
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize(
+    "initial_source,selection",
+    [
+        (None, None),
+        (STATE_SOURCE_MOTOR_DP47, None),
+        (STATE_SOURCE_HX201_DP40, None),
+        (None, STATE_SOURCE_HX201_DP40),
+        (STATE_SOURCE_HX201_DP40, STATE_SOURCE_MOTOR_DP47),
+    ],
+)
+async def test_edit_preserves_state_source_and_defaults_legacy_entries_to_motor(
+    hass, monkeypatch, initial_source, selection
+):
+    """Editing a name/code keeps the user's profile and treats old entries conservatively."""
+    old_lock = deepcopy(LOCK)
+    if initial_source is None:
+        old_lock.pop(CONF_STATE_SOURCE)
+    else:
+        old_lock[CONF_STATE_SOURCE] = initial_source
+    config_entry = entry(hass, **{CONF_LOCKS: [old_lock]})
+    monkeypatch.setattr(hass.config_entries, "async_reload", AsyncMock(return_value=True))
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": config_entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "gateway"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {key: GATEWAY[key] for key in (CONF_NAME, CONF_HOST, CONF_VERSION)},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "edit_lock"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_DEVICE_ID: LOCK[CONF_DEVICE_ID]}
+    )
+    form_values = {CONF_NAME: "New lock name", CONF_PROFILE: True, CONF_MEMBER: 1}
+    expected = initial_source or STATE_SOURCE_MOTOR_DP47
+    assert result["data_schema"](form_values)[CONF_STATE_SOURCE] == expected
+    if selection is not None:
+        form_values[CONF_STATE_SOURCE] = selection
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], form_values)
+    await hass.config_entries.flow.async_configure(result["flow_id"], {"next_step_id": "finish"})
+    assert config_entry.data[CONF_LOCKS][0][CONF_STATE_SOURCE] == (selection or expected)
+    assert config_entry.data[CONF_LOCKS][0][CONF_REMOTE_CODE] == LOCK[CONF_REMOTE_CODE]
+
+
+async def test_cloud_rediscovery_does_not_replace_a_saved_state_source(hass, monkeypatch):
+    """Finding the known HX201 PID again does not override a previous user selection."""
+    config_entry = entry(hass)
+    monkeypatch.setattr(hass.config_entries, "async_reload", AsyncMock(return_value=True))
+    discovery = GatewayDiscovery(
+        GATEWAY[CONF_GATEWAY_ID],
+        GATEWAY[CONF_NAME],
+        GATEWAY[CONF_LOCAL_KEY],
+        [
+            DiscoveredLock(
+                LOCK[CONF_DEVICE_ID],
+                LOCK[CONF_NODE_ID],
+                LOCK[CONF_NAME],
+                "HX201_BLE_LOCKER",
+                True,
+                product_id=HX201_PRODUCT_ID,
+            )
+        ],
+    )
+    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(return_value=discovery))
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": config_entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "cloud"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {key: value for key, value in CLOUD.items() if key != CONF_GATEWAY_ID}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {key: GATEWAY[key] for key in (CONF_NAME, CONF_HOST, CONF_VERSION)},
+    )
+    assert result["step_id"] == "no_locks"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    await hass.config_entries.flow.async_configure(result["flow_id"], {"next_step_id": "finish"})
+    assert config_entry.data[CONF_LOCKS] == [LOCK]
 
 
 @pytest.mark.parametrize("remote_code,confirmed", [("too-short", True), ("12345678", False)])
@@ -283,6 +451,7 @@ async def test_reconfigure_keeps_identity_and_can_replace_code(hass, monkeypatch
             CONF_PROFILE: True,
             CONF_MEMBER: 2,
             CONF_REMOTE_CODE: "87654321",
+            CONF_STATE_SOURCE: STATE_SOURCE_MOTOR_DP47,
         },
     )
     result = await hass.config_entries.flow.async_configure(
@@ -297,6 +466,115 @@ async def test_reconfigure_keeps_identity_and_can_replace_code(hass, monkeypatch
     assert config_entry.data[CONF_LOCKS][0][CONF_DEVICE_ID] == LOCK[CONF_DEVICE_ID]
     assert config_entry.data[CONF_LOCKS][0][CONF_REMOTE_CODE] == "87654321"
     reload_entry.assert_awaited_once_with(config_entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    "changes,reuse_connection",
+    [
+        ({}, True),
+        ({CONF_NAME: "Renamed gateway"}, True),
+        ({CONF_HOST: "192.0.2.20"}, False),
+        ({CONF_LOCAL_KEY: "fedcba9876543210"}, False),
+        ({CONF_VERSION: "3.4"}, False),
+    ],
+)
+async def test_loaded_reconfigure_routes_gateway_probe_through_connection_owner(
+    hass, flow_mocks, changes, reuse_connection
+):
+    """A running entry coordinates probe traffic instead of opening a competing socket."""
+    config_entry = entry(hass)
+    config_entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+    coordinator = MagicMock()
+    coordinator.async_probe = AsyncMock(return_value=flow_mocks.probe.return_value)
+    config_entry.runtime_data = coordinator
+    previous = deepcopy(dict(config_entry.data))
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": config_entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "gateway"}
+    )
+    submitted = {
+        CONF_NAME: GATEWAY[CONF_NAME],
+        CONF_HOST: GATEWAY[CONF_HOST],
+        CONF_VERSION: GATEWAY[CONF_VERSION],
+        **changes,
+    }
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], submitted)
+    assert result["step_id"] == "manage"
+    coordinator.async_probe.assert_awaited_once_with(flow_mocks, reuse_connection=reuse_connection)
+    flow_mocks.probe.assert_not_called()
+    flow_mocks.unlock.assert_not_called()
+    config_flow.GatewayClient.assert_called_once_with(
+        submitted[CONF_HOST],
+        GATEWAY[CONF_GATEWAY_ID],
+        changes.get(CONF_LOCAL_KEY, GATEWAY[CONF_LOCAL_KEY]),
+        float(submitted[CONF_VERSION]),
+    )
+    assert config_entry.data == previous
+
+
+async def test_loaded_reconfigure_probe_failure_keeps_configuration_and_redacts_error(
+    hass, flow_mocks
+):
+    """A coordinator probe failure is a normal form error with no partial edits."""
+    config_entry = entry(hass)
+    config_entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+    coordinator = MagicMock()
+    coordinator.async_probe = AsyncMock(side_effect=LocalError("private-gateway-error"))
+    config_entry.runtime_data = coordinator
+    previous = deepcopy(dict(config_entry.data))
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": config_entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "gateway"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_NAME: "New name", CONF_HOST: "192.0.2.20", CONF_VERSION: "3.5"},
+    )
+    assert result["step_id"] == "gateway"
+    assert result["errors"] == {"base": "cannot_connect"}
+    assert "private-gateway-error" not in repr(result)
+    assert config_entry.data == previous
+    coordinator.async_probe.assert_awaited_once_with(flow_mocks, reuse_connection=False)
+    flow_mocks.probe.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state,has_runtime",
+    [
+        (config_entries.ConfigEntryState.LOADED, False),
+        (config_entries.ConfigEntryState.SETUP_ERROR, True),
+    ],
+)
+async def test_reconfigure_without_running_coordinator_probes_candidate_directly(
+    hass, flow_mocks, state, has_runtime
+):
+    """An entry that does not own an active connection can use an ordinary probe."""
+    config_entry = entry(hass)
+    config_entry.mock_state(hass, state)
+    coordinator = MagicMock()
+    coordinator.async_probe = AsyncMock()
+    if has_runtime:
+        config_entry.runtime_data = coordinator
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": config_entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "gateway"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_NAME: GATEWAY[CONF_NAME], CONF_HOST: GATEWAY[CONF_HOST], CONF_VERSION: "3.5"},
+    )
+    assert result["step_id"] == "manage"
+    flow_mocks.probe.assert_called_once()
+    coordinator.async_probe.assert_not_awaited()
 
 
 async def test_options_updates_polling_without_changing_credentials(hass, monkeypatch):
@@ -553,6 +831,7 @@ async def test_multiple_cloud_locks_keep_independent_node_member_and_code(
             CONF_NAME: "Second configured lock",
             CONF_MEMBER: 3,
             CONF_REMOTE_CODE: "87654321",
+            CONF_STATE_SOURCE: STATE_SOURCE_MOTOR_DP47,
         },
     ]
     flow_mocks.unlock.assert_not_called()

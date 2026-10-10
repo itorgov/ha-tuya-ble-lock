@@ -58,6 +58,7 @@ class DiscoveredLock:
     product_name: str
     supported: bool
     unsupported_reason: str | None = None
+    product_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -144,6 +145,11 @@ class _DiscoveryClient:
 def _text(value: Any, fallback: str) -> str:
     """Select a nonempty display label without retaining arbitrary metadata."""
     return value if isinstance(value, str) and value.strip() else fallback
+
+
+def _product_id(value: Any) -> str | None:
+    """Keep only a valid product identifier for selecting a known state profile."""
+    return value if isinstance(value, str) and _DEVICE_ID.fullmatch(value) else None
 
 
 def _supports_unlock(specification: Any) -> bool:
@@ -239,7 +245,7 @@ async def async_discover_gateway(
             raise CloudError("Tuya returned conflicting child device IDs")
         seen_devices.add(device_id)
         display_metadata = child
-        if not _text(child.get("name"), ""):
+        if not _text(child.get("name"), "") or _product_id(child.get("product_id")) is None:
             details = await client.get(f"/v1.1/iot-03/devices/{device_id}")
             if not isinstance(details, dict) or details.get("id") != device_id:
                 raise CloudError("Tuya did not return the selected child")
@@ -262,6 +268,7 @@ async def async_discover_gateway(
                 product_name=_text(display_metadata.get("product_name"), "Tuya Bluetooth device"),
                 supported=reason is None,
                 unsupported_reason=reason,
+                product_id=_product_id(display_metadata.get("product_id")),
             )
         )
 

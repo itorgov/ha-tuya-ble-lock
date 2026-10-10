@@ -47,6 +47,7 @@ def mock_gateway():
             return_value={"test_node": LockStatus(True, 72)},
         ) as poll,
         patch("custom_components.tuya_ble_lock.local.GatewayClient.unlock") as unlock,
+        patch("custom_components.tuya_ble_lock.local.GatewayClient.listen") as listen,
         patch("custom_components.tuya_ble_lock.local.GatewayClient.close") as close,
     ):
-        yield {"poll": poll, "unlock": unlock, "close": close}
+        yield {"poll": poll, "unlock": unlock, "listen": listen, "close": close}

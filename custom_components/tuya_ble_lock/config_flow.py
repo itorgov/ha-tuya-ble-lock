@@ -10,6 +10,7 @@ from typing import Any
 import probatio as vol
 from homeassistant.config_entries import (
     ConfigEntry,
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlowWithReload,
@@ -36,11 +37,15 @@ from .const import (
     CONF_PAYLOAD,
     CONF_PROFILE,
     CONF_REMOTE_CODE,
+    CONF_STATE_SOURCE,
     CONF_VERSION,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    HX201_PRODUCT_ID,
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
+    STATE_SOURCE_HX201_DP40,
+    STATE_SOURCE_MOTOR_DP47,
 )
 from .local import GatewayClient, LocalError, Topology, build_unlock
 
@@ -90,6 +95,11 @@ def _credentials(data: dict[str, Any], previous: dict[str, Any]) -> dict[str, An
     result[CONF_NAME] = data[CONF_NAME].strip()
     if not result[CONF_NAME] or not data.get(CONF_PROFILE):
         raise ValueError("Profile must be confirmed")
+    state_source = data.get(
+        CONF_STATE_SOURCE, previous.get(CONF_STATE_SOURCE, STATE_SOURCE_MOTOR_DP47)
+    )
+    if state_source not in (STATE_SOURCE_MOTOR_DP47, STATE_SOURCE_HX201_DP40):
+        raise ValueError("Invalid lock state source")
     member = data.get(CONF_MEMBER, previous.get(CONF_MEMBER, 1))
     code = data.get(CONF_REMOTE_CODE) or previous.get(CONF_REMOTE_CODE)
     if data.get("clear_code"):
@@ -107,7 +117,7 @@ def _credentials(data: dict[str, Any], previous: dict[str, Any]) -> dict[str, An
         build_unlock(member, code)
     elif type(member) is not int or not 1 <= member <= 65534:
         raise ValueError("Invalid member")
-    result.update({CONF_MEMBER: member, CONF_REMOTE_CODE: code})
+    result.update({CONF_MEMBER: member, CONF_REMOTE_CODE: code, CONF_STATE_SOURCE: state_source})
     return result
 
 
@@ -199,7 +209,20 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                     candidate[CONF_LOCAL_KEY],
                     float(candidate[CONF_VERSION]),
                 )
-                self._topology = await self.hass.async_add_executor_job(client.probe)
+                entry = self._get_reconfigure_entry() if self._reconfigure else None
+                coordinator = getattr(entry, "runtime_data", None)
+                if entry is not None and entry.state is ConfigEntryState.LOADED and coordinator:
+                    # Gateways may accept only one TCP connection. The running
+                    # coordinator owns that connection and serializes the read.
+                    self._topology = await coordinator.async_probe(
+                        client,
+                        reuse_connection=all(
+                            candidate[key] == entry.data[key]
+                            for key in (CONF_HOST, CONF_GATEWAY_ID, CONF_LOCAL_KEY, CONF_VERSION)
+                        ),
+                    )
+                else:
+                    self._topology = await self.hass.async_add_executor_job(client.probe)
             except ValueError, UnicodeError, KeyError, TypeError:
                 errors["base"] = "invalid_input"
             except LocalError:
@@ -263,6 +286,11 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                         CONF_NODE_ID: candidates[item].node_id,
                         CONF_NAME: candidates[item].name,
                         CONF_MEMBER: 1,
+                        CONF_STATE_SOURCE: (
+                            STATE_SOURCE_HX201_DP40
+                            if candidates[item].product_id == HX201_PRODUCT_ID
+                            else STATE_SOURCE_MOTOR_DP47
+                        ),
                     }
                     for item in selected
                 ]
@@ -369,6 +397,15 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_NAME, default=lock[CONF_NAME]): str,
                     vol.Required(CONF_PROFILE, default=False): BooleanSelector(),
+                    vol.Required(
+                        CONF_STATE_SOURCE,
+                        default=lock.get(CONF_STATE_SOURCE, STATE_SOURCE_MOTOR_DP47),
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[STATE_SOURCE_MOTOR_DP47, STATE_SOURCE_HX201_DP40],
+                            translation_key="state_source",
+                        )
+                    ),
                     vol.Required(CONF_MEMBER, default=lock.get(CONF_MEMBER, 1)): vol.All(
                         vol.Coerce(int), vol.Range(min=1, max=65534)
                     ),

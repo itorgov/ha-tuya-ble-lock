@@ -63,7 +63,7 @@
         }
       },
       "lock": {
-        "title": "Configure the existing unlock code",
+        "title": "Configure lock status and unlock code",
         "description": "Confirm the supported HX201-style DP61 profile described in the README. Enter an existing eight-digit remote unlock code and member number, OR paste the Base64 value of your own successful DP61 unlock command. The payload overrides member/code fields and is not stored. Leave credentials blank for status only, or to retain a saved code. Local Key and keypad PIN are different credentials.",
         "data": {
           "name": "Lock name",
@@ -71,7 +71,11 @@
           "member": "Member number",
           "remote_unlock_code": "Existing eight-digit remote unlock code",
           "unlock_payload": "Existing DP61 command (Base64)",
-          "clear_code": "Remove the saved unlock code"
+          "clear_code": "Remove the saved unlock code",
+          "state_source": "Lock state source"
+        },
+        "data_description": {
+          "state_source": "Select HX201 / T1 only for the verified cabinet-lock profile. Other locks use the standard DP47 state. Changing this setting does not send a command."
         }
       },
       "edit_lock": {
@@ -107,7 +111,7 @@
     "step": {
       "init": {
         "title": "Polling interval",
-        "description": "Read local gateway and child status every 30 to 600 seconds. This never unlocks a lock.",
+        "description": "Refresh gateway connectivity and request child status every 30 to 600 seconds. State changes are also received continuously over the local connection. This never unlocks a lock.",
         "data": {
           "scan_interval": "Polling interval (seconds)"
         }
@@ -115,11 +119,6 @@
     }
   },
   "entity": {
-    "button": {
-      "unlock": {
-        "name": "Unlock"
-      }
-    },
     "sensor": {
       "battery": {
         "name": "Battery"
@@ -135,6 +134,14 @@
     },
     "unlock_failed": {
       "message": "Unlock could not be verified; the command may have reached the lock. Check its physical state before trying again. No automatic retry was sent."
+    }
+  },
+  "selector": {
+    "state_source": {
+      "options": {
+        "motor_dp47": "Standard lock state (DP47)",
+        "hx201_dp40": "HX201 / T1 cabinet lock (DP40)"
+      }
     }
   }
 }
