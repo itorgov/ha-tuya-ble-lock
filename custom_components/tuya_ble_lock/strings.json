@@ -95,6 +95,7 @@
     "error": {
       "invalid_auth": "Tuya rejected the project credentials or authorization. Check the data center, credentials and authorized API services.",
       "cloud_error": "Cannot read Tuya device metadata. Check project linking, API permissions, subscription and gateway ID.",
+      "cloud_request_failed": "Cloud setup failed while {stage}. {details} {reference}",
       "invalid_input": "Check the IPv4 address, exact IDs, 16-byte Local Key and protocol version.",
       "cannot_connect": "Cannot read local gateway topology. Check the address, Local Key, protocol, network access and other local clients.",
       "no_locks_selected": "Select at least one available lock.",

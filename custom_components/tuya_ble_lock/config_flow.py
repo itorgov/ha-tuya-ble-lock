@@ -59,6 +59,102 @@ _REGIONS = {
     "in": "India",
     "sg": "Singapore",
 }
+_CLOUD_STAGES = {
+    "unknown": "contacting Tuya",
+    "token": "requesting an access token",
+    "gateway_details": "reading the gateway details",
+    "gateway_children": "listing the gateway's locks",
+    "child_details": "reading a lock's details",
+    "child_specification": "checking a lock's supported commands",
+}
+_CLOUD_REASONS = {
+    "connection": "Cannot reach Tuya. Check Home Assistant's internet connection and DNS, then retry.",
+    "timeout": "Tuya did not respond in time. Check connectivity and try again shortly.",
+    "invalid_json": "Tuya returned an unreadable response. Try again later; check any proxy or network filter if it persists.",
+    "http_error": "Tuya rejected the HTTP request. Check the data center and project access, then retry.",
+    "api_error": "Tuya rejected the request. Check project linking, API permissions, subscription and the gateway Device ID.",
+    "invalid_response": "Tuya returned incomplete device information. Retry; if it persists, report the failed stage without sharing credentials.",
+    "invalid_input": "Check the project Access ID, Access Secret, data center and gateway Device ID.",
+    "invalid_token": "Tuya did not return a usable access token. Check project credentials and the data center, then retry.",
+    "invalid_gateway": "Tuya did not return the requested gateway. Check its Device ID, linked app account and data center.",
+    "missing_local_key": "The gateway details contain no Local Key. Check project device permissions and that you entered the gateway's Device ID.",
+    "invalid_local_key": "Tuya returned an unusable gateway Local Key. Check the gateway Device ID and retry discovery.",
+    "invalid_children": "Tuya returned an invalid gateway device list. Check the locks are linked to this gateway in the app, then retry.",
+    "conflicting_children": "Tuya returned conflicting lock identities. Check the gateway's device list in the app, then retry.",
+    "invalid_child": "Tuya returned an invalid lock identity. Check the gateway's device list and linked app account, then retry.",
+}
+# Fixed guidance for documented Tuya codes; never display the vendor's message.
+# https://developer.tuya.com/en/docs/iot/error-code?id=K989ruxx88swc
+_CLOUD_CODE_DETAILS = {
+    **dict.fromkeys(
+        ("1001", "1004", "1005"),
+        "Tuya rejected the project credentials or signature. Check the Access ID, Access Secret and selected data center.",
+    ),
+    **dict.fromkeys(
+        ("1002", "1010", "1011", "1012", "1400"),
+        "Tuya rejected the access token. Submit again for a new token; if it persists, check project credentials and the data center.",
+    ),
+    **dict.fromkeys(
+        ("1106", "2406", "28841105", "60009001"),
+        "Check that the required APIs are authorized for this project and that its linked app account grants access to the gateway and locks.",
+    ),
+    **dict.fromkeys(
+        ("28841001", "28841101", "28841106"),
+        "The required cloud service is not subscribed. Check the project's service subscriptions and API authorization on the Tuya Developer Platform.",
+    ),
+    **dict.fromkeys(
+        ("28841002", "28841102"),
+        "The cloud service subscription has expired. Review its renewal or trial-extension options on the Tuya Developer Platform.",
+    ),
+    **dict.fromkeys(
+        ("28841003", "28841103"),
+        "Tuya reports an overdue cloud service bill. Review the service's billing status on the Tuya Developer Platform.",
+    ),
+    **dict.fromkeys(
+        ("28841004", "28841104"),
+        "The cloud service quota is exhausted. Wait for its reset or review the project's quota options on the Tuya Developer Platform.",
+    ),
+    **dict.fromkeys(
+        ("500", "1110", "1111", "1112", "1113", "1199"),
+        "Tuya is busy, synchronizing data or limiting requests. Wait a few minutes before retrying.",
+    ),
+    **dict.fromkeys(
+        ("2010", "40000901"),
+        "Tuya cannot find the device. Check the gateway Device ID, selected data center and linked app account's device list.",
+    ),
+    "1013": "Check that the Home Assistant host's date and time are correct and automatically synchronized, then retry.",
+    "1108": "Tuya rejected the API address. Check the selected data center and integration version; report this code if it persists.",
+    "1114": "Check the project's cloud authorization IP allowlist: it must permit the public IP used by Home Assistant.",
+}
+
+
+def _cloud_error_details(error: CloudError) -> dict[str, str] | None:
+    """Translate only validated diagnostic metadata, including on legacy errors."""
+    # Revalidate at the UI boundary in case a caller modified exception attrs.
+    safe = CloudError(
+        stage=getattr(error, "stage", "unknown"),
+        reason=getattr(error, "reason", "unknown"),
+        code=getattr(error, "code", None),
+        status=getattr(error, "status", None),
+    )
+    if safe.reason not in _CLOUD_REASONS:
+        return None
+    details = _CLOUD_REASONS[safe.reason]
+    reference = ""
+    if safe.code is not None:
+        reference = f"(Tuya error {safe.code})"
+        details = _CLOUD_CODE_DETAILS.get(safe.code, details)
+    elif safe.status is not None and safe.status >= 300:
+        reference = f"(HTTP {safe.status})"
+        if safe.status in (401, 403):
+            details = (
+                "Check the project credentials, selected data center and authorized API services."
+            )
+        elif safe.status == 429:
+            details = "Tuya is limiting requests. Wait a few minutes before retrying."
+        elif safe.status >= 500:
+            details = "Tuya's service is unavailable. Try again later."
+    return {"stage": _CLOUD_STAGES[safe.stage], "details": details, "reference": reference}
 
 
 def _identifier(value: Any) -> str:
@@ -134,6 +230,7 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
         self._pending: list[dict[str, Any]] = []
         self._editing: dict[str, Any] | None = None
         self._reconfigure = False
+        self._cloud_region = "eu"
 
     @staticmethod
     @callback
@@ -148,7 +245,11 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_cloud(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Read the selected gateway's key and children from Tuya once."""
         errors = {}
+        placeholders = None
         if user_input is not None:
+            region = user_input.get("region")
+            if type(region) is str and region in _REGIONS:
+                self._cloud_region = region
             gateway_id = (
                 self._data.get(CONF_GATEWAY_ID)
                 if CONF_GATEWAY_ID in self._data
@@ -163,10 +264,15 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                     user_input["client_secret"],
                     gateway_id,
                 )
-            except CloudAuthError:
-                errors["base"] = "invalid_auth"
-            except CloudError:
-                errors["base"] = "cloud_error"
+            except CloudError as error:
+                placeholders = _cloud_error_details(error)
+                errors["base"] = (
+                    "cloud_request_failed"
+                    if placeholders is not None
+                    else "invalid_auth"
+                    if isinstance(error, CloudAuthError)
+                    else "cloud_error"
+                )
             except ValueError:
                 errors["base"] = "invalid_input"
             else:
@@ -177,7 +283,7 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                 self._discovered = list(discovery.locks)
                 return await self.async_step_gateway()
         schema = {
-            vol.Required("region", default="eu"): SelectSelector(
+            vol.Required("region", default=self._cloud_region): SelectSelector(
                 SelectSelectorConfig(
                     options=[{"value": key, "label": label} for key, label in _REGIONS.items()]
                 )
@@ -187,7 +293,12 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
         }
         if CONF_GATEWAY_ID not in self._data:
             schema[vol.Required(CONF_GATEWAY_ID)] = str
-        return self.async_show_form(step_id="cloud", data_schema=vol.Schema(schema), errors=errors)
+        return self.async_show_form(
+            step_id="cloud",
+            data_schema=vol.Schema(schema),
+            errors=errors,
+            description_placeholders=placeholders,
+        )
 
     async def async_step_gateway(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Verify the local gateway using a read-only topology query."""

@@ -388,6 +388,182 @@ async def test_cloud_errors_are_shown_without_credentials(hass, monkeypatch, exc
     assert "test-secret" not in repr(result)
 
 
+@pytest.mark.parametrize(
+    "stage,expected",
+    [
+        ("token", "requesting an access token"),
+        ("gateway_details", "reading the gateway details"),
+        ("gateway_children", "listing the gateway's locks"),
+        ("child_details", "reading a lock's details"),
+        ("child_specification", "checking a lock's supported commands"),
+    ],
+)
+async def test_cloud_failure_identifies_stage_without_exposing_response(
+    hass, monkeypatch, caplog, stage, expected
+):
+    error = CloudError(
+        "PRIVATE_RESPONSE test-secret test-client gateway-example",
+        stage=stage,
+        reason="api_error",
+        code="1106",
+        status=200,
+    )
+    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(side_effect=error))
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    assert result["errors"] == {"base": "cloud_request_failed"}
+    details = result["description_placeholders"]
+    assert details["stage"] == expected
+    assert "authorized" in details["details"]
+    assert details["reference"] == "(Tuya error 1106)"
+    for value in ("PRIVATE_RESPONSE", "test-secret", "test-client", "gateway-example"):
+        assert value not in repr(result)
+        assert value not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("connection", "DNS"),
+        ("timeout", "did not respond in time"),
+        ("invalid_json", "unreadable response"),
+        ("invalid_response", "incomplete device information"),
+        ("invalid_input", "Access ID"),
+        ("invalid_token", "usable access token"),
+        ("invalid_gateway", "requested gateway"),
+        ("missing_local_key", "no Local Key"),
+        ("invalid_local_key", "unusable gateway Local Key"),
+        ("invalid_children", "invalid gateway device list"),
+        ("conflicting_children", "conflicting lock identities"),
+        ("invalid_child", "invalid lock identity"),
+    ],
+)
+async def test_cloud_failure_reason_gives_fixed_action(hass, monkeypatch, reason, expected):
+    error = CloudError("PRIVATE_BODY", stage="gateway_details", reason=reason)
+    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(side_effect=error))
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    assert result["errors"] == {"base": "cloud_request_failed"}
+    assert expected in result["description_placeholders"]["details"]
+    assert result["description_placeholders"]["reference"] == ""
+    assert "PRIVATE_BODY" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        ("1004", "Access Secret"),
+        ("1010", "new token"),
+        ("28841105", "authorized"),
+        ("60009001", "authorized"),
+        ("28841101", "not subscribed"),
+        ("28841002", "expired"),
+        ("28841103", "overdue"),
+        ("28841004", "quota is exhausted"),
+        ("1013", "date and time"),
+        ("1114", "public IP"),
+        ("2010", "cannot find the device"),
+        ("40000901", "cannot find the device"),
+        ("1108", "API address"),
+        ("1199", "limiting requests"),
+    ],
+)
+async def test_known_tuya_codes_have_actionable_explanations(code, expected):
+    details = config_flow._cloud_error_details(
+        CloudError("PRIVATE_BODY", stage="gateway_children", reason="api_error", code=code)
+    )
+    assert expected in details["details"]
+    assert details["reference"] == f"(Tuya error {code})"
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [(403, "authorized API services"), (429, "limiting requests"), (503, "unavailable")],
+)
+async def test_http_failure_has_safe_status_and_instructions(hass, monkeypatch, status, expected):
+    error = CloudError(stage="token", reason="http_error", status=status)
+    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(side_effect=error))
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    assert result["errors"] == {"base": "cloud_request_failed"}
+    assert expected in result["description_placeholders"]["details"]
+    assert result["description_placeholders"]["reference"] == f"(HTTP {status})"
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        {"stage": ["PRIVATE_STAGE"], "reason": {"PRIVATE_REASON": 1}},
+        {"stage": "PRIVATE_STAGE", "reason": "PRIVATE_REASON"},
+        {"stage": None, "reason": None},
+    ],
+)
+async def test_malformed_cloud_metadata_uses_legacy_safe_error(hass, monkeypatch, attributes):
+    error = CloudAuthError("PRIVATE_BODY")
+    for key, value in {**attributes, "code": "PRIVATE_CODE", "status": "PRIVATE_STATUS"}.items():
+        setattr(error, key, value)
+    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(side_effect=error))
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    assert result["errors"] == {"base": "invalid_auth"}
+    assert not result.get("description_placeholders")
+    assert "PRIVATE" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "code,status",
+    [("12345678", "403"), (True, True), ({"PRIVATE": 1}, [403]), (None, 200)],
+)
+async def test_cloud_error_reference_never_formats_unknown_codes_or_malformed_status(code, status):
+    error = CloudError(stage="token", reason="api_error")
+    error.code, error.status = code, status
+    details = config_flow._cloud_error_details(error)
+    assert details["reference"] == ""
+    assert "12345678" not in repr(details)
+    assert "PRIVATE" not in repr(details)
+
+
+async def test_cloud_retry_keeps_only_selected_region_and_does_not_prefill_credentials(
+    hass, monkeypatch
+):
+    discovery = GatewayDiscovery(
+        GATEWAY[CONF_GATEWAY_ID], GATEWAY[CONF_NAME], GATEWAY[CONF_LOCAL_KEY], []
+    )
+    discover_gateway = AsyncMock(
+        side_effect=[
+            CloudError(stage="token", reason="connection"),
+            discovery,
+        ]
+    )
+    monkeypatch.setattr(config_flow, "async_discover_gateway", discover_gateway)
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**CLOUD, "region": "sg"}
+    )
+    retry = {key: value for key, value in CLOUD.items() if key != "region"}
+    validated = result["data_schema"](retry)
+    assert validated["region"] == "sg"
+    for marker in result["data_schema"].schema:
+        if str(marker.schema) in ("client_id", "client_secret"):
+            assert marker.default is config_flow.vol.UNDEFINED
+            assert not marker.description
+    assert "test-secret" not in repr(result) and "test-client" not in repr(result)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], retry)
+    assert result["step_id"] == "gateway"
+    assert [call.args[1] for call in discover_gateway.await_args_list] == ["sg", "sg"]
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {key: GATEWAY[key] for key in (CONF_NAME, CONF_HOST, CONF_VERSION)}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
+    )
+    assert set(result["data"]) == set(GATEWAY) | {CONF_LOCKS}
+    assert "region" not in result["data"]
+    assert "test-secret" not in repr(result["data"])
+    assert "test-client" not in repr(result["data"])
+    await hass.async_block_till_done()
+
+
 async def test_failed_local_connection_does_not_create_entry(hass, flow_mocks):
     flow_mocks.probe.side_effect = LocalError("connection failed")
     result = await start(hass)

@@ -7,7 +7,7 @@ from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiohttp import ClientError, ClientSession
+from aiohttp import ClientError, ClientSession, ContentTypeError
 
 from custom_components.tuya_ble_lock import cloud
 
@@ -97,7 +97,7 @@ async def test_discovery_signs_read_only_requests_and_preserves_node_id(monkeypa
     requests = session.get.call_args_list
     assert [request.args[0] for request in requests] == [
         "https://openapi.tuyaeu.com/v1.0/token?grant_type=1",
-        "https://openapi.tuyaeu.com/v1.1/iot-03/devices/gateway-example",
+        "https://openapi.tuyaeu.com/v2.0/cloud/thing/gateway-example",
         "https://openapi.tuyaeu.com/v1.0/iot-03/devices/gateway-example/sub-devices",
         "https://openapi.tuyaeu.com/v1.1/devices/lock-example/specifications",
     ]
@@ -108,7 +108,7 @@ async def test_discovery_signs_read_only_requests_and_preserves_node_id(monkeypa
         "t": "1700000000000",
     }
     assert requests[1].kwargs["headers"]["sign"] == (
-        "735143E03A361564B246A09599D4A73B4668FF718B3FFA5131FC8805B8F2E0D3"
+        "DD6DEF7210E87845DEA1EE0CC3D5B20B0E946F8629E656292B6062799533D41A"
     )
     assert requests[1].kwargs["headers"]["access_token"] == "test-token"
     assert all(request.kwargs["allow_redirects"] is False for request in requests)
@@ -148,9 +148,12 @@ async def test_regions_are_fixed_https_endpoints(region, endpoint):
 )
 async def test_invalid_input_makes_no_requests(changes, exception):
     session = session_with()
-    with pytest.raises(exception):
+    with pytest.raises(exception) as error:
         await discover(session, **changes)
     session.get.assert_not_called()
+    assert error.value.reason == "invalid_input"
+    assert error.value.code is None
+    assert error.value.status is None
 
 
 @pytest.mark.asyncio
@@ -162,6 +165,12 @@ async def test_auth_errors_are_sanitized(code):
     with pytest.raises(cloud.CloudAuthError) as error:
         await discover(session)
     assert "private-account-value" not in str(error.value)
+    assert (error.value.stage, error.value.reason, error.value.code, error.value.status) == (
+        "token",
+        "api_error",
+        str(code),
+        200,
+    )
 
 
 @pytest.mark.asyncio
@@ -170,47 +179,234 @@ async def test_http_failure_never_reads_response_body(status):
     raw_response = response(payload={"private": "private-account-value"}, status=status)
     session = session_with(raw_response)
     expected = cloud.CloudAuthError if status in (401, 403) else cloud.CloudError
-    with pytest.raises(expected):
+    with pytest.raises(expected) as error:
         await discover(session)
     raw_response.json.assert_not_called()
+    assert (error.value.stage, error.value.reason, error.value.code, error.value.status) == (
+        "token",
+        "http_error",
+        None,
+        status,
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exception", [ClientError, TimeoutError, ValueError])
-async def test_network_exceptions_do_not_leak_client_headers(exception):
+@pytest.mark.parametrize(
+    "exception,reason",
+    [(ClientError, "connection"), (TimeoutError, "timeout"), (ValueError, "invalid_response")],
+)
+async def test_network_exceptions_do_not_leak_client_headers(exception, reason):
     session = session_with()
     session.get.side_effect = exception("private-account-value")
     with pytest.raises(cloud.CloudError) as error:
         await discover(session)
     assert "private-account-value" not in "".join(traceback.format_exception(error.value))
+    assert (error.value.stage, error.value.reason, error.value.code, error.value.status) == (
+        "token",
+        reason,
+        None,
+        None,
+    )
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "payload",
-    [[], {"success": "true", "result": {}}, {"success": True}, {"success": True, "result": {}}],
-)
-async def test_malformed_auth_metadata_fails_closed(payload):
-    session = session_with(response(payload=payload))
-    with pytest.raises(cloud.CloudError):
+@pytest.mark.parametrize("exception", [ValueError, ContentTypeError])
+async def test_json_errors_keep_safe_stage_and_http_status(exception):
+    raw_response = response()
+    raw_response.json.side_effect = (
+        ContentTypeError(request_info=MagicMock(), history=(), message="private-account-value")
+        if exception is ContentTypeError
+        else exception("private-account-value")
+    )
+    session = session_with(response({"access_token": "test-token"}), raw_response)
+
+    with pytest.raises(cloud.CloudError) as error:
         await discover(session)
 
+    assert (error.value.stage, error.value.reason, error.value.code, error.value.status) == (
+        "gateway_details",
+        "invalid_json",
+        None,
+        200,
+    )
+    assert "private-account-value" not in "".join(traceback.format_exception(error.value))
 
-@pytest.mark.asyncio
+
 @pytest.mark.parametrize(
-    "changes",
+    "stage",
+    ["token", "gateway_details", "gateway_children", "child_details", "child_specification"],
+)
+async def test_api_error_identifies_the_actual_discovery_stage(stage):
+    """Use static operation labels without exposing URL paths or child identities."""
+    responses = []
+    if stage != "token":
+        responses.append(response({"access_token": "test-token"}))
+    if stage in ("gateway_children", "child_details", "child_specification"):
+        responses.append(response(gateway()))
+    if stage in ("child_details", "child_specification"):
+        responses.append(response([child(name=None) if stage == "child_details" else child()]))
+    responses.append(
+        response(
+            payload={
+                "success": False,
+                "code": 1106,
+                "msg": "private-account-value",
+                "result": {"local_key": "another-private-value"},
+            }
+        )
+    )
+    session = session_with(*responses)
+
+    with pytest.raises(cloud.CloudAuthError) as error:
+        await discover(session)
+
+    assert vars(error.value) == {
+        "stage": stage,
+        "reason": "api_error",
+        "code": "1106",
+        "status": 200,
+    }
+    assert "private" not in repr(error.value)
+    assert session.get.call_count == len(responses)
+
+
+@pytest.mark.parametrize(
+    "code",
     [
-        {"local_key": None},
-        {"local_key": "too-short"},
-        {"local_key": "0123456789abcde\n"},
-        {"id": "different-gateway"},
-        {"sub": True},
+        28841001,
+        "28841002",
+        28841003,
+        28841004,
+        28841101,
+        28841102,
+        28841103,
+        28841104,
+        28841106,
+        60009001,
+        1013,
+        1108,
+        2010,
+        40000901,
+        1114,
+        1199,
     ],
 )
-async def test_invalid_gateway_metadata_fails_closed(changes):
-    session = session_with(response({"access_token": "test-token"}), response(gateway(**changes)))
-    with pytest.raises(cloud.CloudError):
+async def test_known_non_auth_error_codes_are_preserved_without_reclassification(code):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(payload={"success": False, "code": code, "msg": "private-account-value"}),
+    )
+
+    with pytest.raises(cloud.CloudError) as error:
         await discover(session)
+
+    assert type(error.value) is cloud.CloudError
+    assert error.value.stage == "gateway_details"
+    assert error.value.reason == "api_error"
+    assert error.value.code == str(code)
+    assert "private-account-value" not in repr(error.value)
+
+
+@pytest.mark.parametrize(
+    "untrusted",
+    [
+        "private-account-value",
+        "1106\n",
+        " 1106",
+        "１１０６",
+        "99999999",
+        1106.0,
+        True,
+        {},
+        [],
+        10**100,
+    ],
+)
+async def test_untrusted_api_code_is_never_exposed_or_interpreted_as_auth(untrusted):
+    session = session_with(
+        response(payload={"success": False, "code": untrusted, "msg": "private-account-value"})
+    )
+
+    with pytest.raises(cloud.CloudError) as error:
+        await discover(session)
+
+    assert type(error.value) is cloud.CloudError
+    assert vars(error.value) == {
+        "stage": "token",
+        "reason": "api_error",
+        "code": None,
+        "status": 200,
+    }
+    assert "private-account-value" not in repr(error.value)
+
+
+@pytest.mark.parametrize("untrusted", ["private-account-value", {}, [], True, 200.0, 99, 600])
+def test_exception_diagnostic_fields_reject_untrusted_values(untrusted):
+    """Legacy message construction remains valid, while only attributes are UI-safe."""
+    error = cloud.CloudError(
+        "private-value", stage=untrusted, reason=untrusted, code=untrusted, status=untrusted
+    )
+    assert vars(error) == {"stage": "unknown", "reason": "unknown", "code": None, "status": None}
+
+
+def test_legacy_exception_construction_has_safe_unknown_metadata():
+    error = cloud.CloudError("private-value")
+    assert vars(error) == {"stage": "unknown", "reason": "unknown", "code": None, "status": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,reason",
+    [
+        ([], "invalid_response"),
+        ({"success": "true", "result": {}}, "api_error"),
+        ({"success": True}, "invalid_response"),
+        ({"success": True, "result": {}}, "invalid_token"),
+    ],
+)
+async def test_malformed_auth_metadata_fails_closed(payload, reason):
+    session = session_with(response(payload=payload))
+    with pytest.raises(cloud.CloudError) as error:
+        await discover(session)
+    assert error.value.stage == "token"
+    assert error.value.reason == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"local_key": None}, "missing_local_key"),
+        ({"local_key": ""}, "missing_local_key"),
+        ({"local_key": "too-short"}, "invalid_local_key"),
+        ({"local_key": "0123456789abcde\n"}, "invalid_local_key"),
+        ({"id": "different-gateway"}, "invalid_gateway"),
+    ],
+)
+async def test_invalid_gateway_metadata_fails_closed(changes, reason):
+    session = session_with(response({"access_token": "test-token"}), response(gateway(**changes)))
+    with pytest.raises(cloud.CloudError) as error:
+        await discover(session)
+    assert error.value.stage == "gateway_details"
+    assert error.value.reason == reason
+    assert error.value.code is None
+
+
+async def test_gateway_reporting_sub_true_can_proceed_to_local_verification():
+    """A cloud classification flag cannot disqualify a functioning gateway."""
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway(sub=True)),
+        response([child()]),
+        response(specification()),
+    )
+
+    result = await discover(session)
+
+    assert result.gateway_id == "gateway-example"
+    assert result.local_key == "0123456789abcdef"
+    assert result.locks[0].supported is True
+    assert result.locks[0].node_id == "abcdef012345"
+    assert session.get.call_count == 4
 
 
 @pytest.mark.asyncio
@@ -241,7 +437,9 @@ async def test_other_children_are_not_automatically_classified_as_supported_lock
 
 
 @pytest.mark.parametrize("stage", ["metadata", "specification"])
-@pytest.mark.parametrize("failure", ["http", "api", "network"])
+@pytest.mark.parametrize(
+    "failure", ["http", "api", "network", "missing", "offline", "busy", "ambiguous", "malformed"]
+)
 async def test_child_lookup_failure_preserves_verified_siblings(stage, failure):
     """A stale child cannot prevent setup of verified locks on the same gateway."""
     failed_child = child(id="unverified-child", node_id="secondnode")
@@ -251,6 +449,11 @@ async def test_child_lookup_failure_preserves_verified_siblings(stage, failure):
         "http": response(status=500),
         "api": response(payload={"success": False, "code": "unexpected", "msg": "private"}),
         "network": ClientError("private"),
+        "missing": response(status=404),
+        "offline": response(payload={"success": False, "code": 2001, "msg": "private"}),
+        "busy": response(payload={"success": False, "code": 1111, "msg": "private"}),
+        "ambiguous": response(payload={"success": False, "code": 2007, "msg": "private"}),
+        "malformed": response(payload=[]),
     }[failure]
     session = session_with(
         response({"access_token": "test-token"}),
@@ -271,7 +474,7 @@ async def test_child_lookup_failure_preserves_verified_siblings(stage, failure):
     ]
     assert result.locks[1].unsupported_reason == f"{stage}_unavailable"
     expected_path = (
-        "/v1.1/iot-03/devices/unverified-child"
+        "/v2.0/cloud/thing/unverified-child"
         if stage == "metadata"
         else "/v1.1/devices/unverified-child/specifications"
     )
@@ -297,6 +500,50 @@ async def test_child_auth_failure_still_aborts_discovery(stage, failure):
     with pytest.raises(cloud.CloudAuthError):
         await discover(session)
 
+    assert session.get.call_count == 4
+
+
+@pytest.mark.parametrize("stage", ["child_details", "child_specification"])
+@pytest.mark.parametrize(
+    "code",
+    [
+        28841001,
+        28841002,
+        28841003,
+        28841004,
+        28841101,
+        28841102,
+        28841103,
+        28841104,
+        28841106,
+        60009001,
+        1108,
+        1013,
+        1400,
+        1114,
+    ],
+)
+async def test_child_service_error_reaches_setup_with_stage_and_code(stage, code):
+    """Project/API failures must not masquerade as unsupported lock profiles."""
+    selected_child = child(name=None) if stage == "child_details" else child()
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway()),
+        response([selected_child, child(id="last-lock", node_id="thirdnode")]),
+        response(payload={"success": False, "code": code, "msg": "private-account-value"}),
+    )
+
+    with pytest.raises(cloud.CloudError) as error:
+        await discover(session)
+
+    assert type(error.value) is cloud.CloudError
+    assert vars(error.value) == {
+        "stage": stage,
+        "reason": "api_error",
+        "code": str(code),
+        "status": 200,
+    }
+    assert "private-account-value" not in repr(error.value)
     assert session.get.call_count == 4
 
 
@@ -332,23 +579,25 @@ async def test_unverified_child_cannot_hide_a_conflicting_node_id():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "children",
+    "children,reason",
     [
-        {},
-        [None],
-        [child(id="../invalid")],
-        [child(id="gateway-example")],
-        [child(), child()],
-        [child(), child(id="another-lock")],
+        ({}, "invalid_children"),
+        ([None], "invalid_child"),
+        ([child(id="../invalid")], "invalid_child"),
+        ([child(id="gateway-example")], "conflicting_children"),
+        ([child(), child()], "conflicting_children"),
+        ([child(), child(id="another-lock")], "conflicting_children"),
     ],
 )
-async def test_conflicting_or_malformed_children_fail_closed(children):
+async def test_conflicting_or_malformed_children_fail_closed(children, reason):
     responses = [response({"access_token": "test-token"}), response(gateway()), response(children)]
     if isinstance(children, list) and len(children) > 1:
         responses.append(response(specification()))
     session = session_with(*responses)
-    with pytest.raises(cloud.CloudError):
+    with pytest.raises(cloud.CloudError) as error:
         await discover(session)
+    assert error.value.stage == "gateway_children"
+    assert error.value.reason == reason
 
 
 @pytest.mark.parametrize(
@@ -406,7 +655,7 @@ async def test_missing_child_name_is_loaded_from_verified_device_details(missing
     assert result.locks[0].product_name == "Example model"
     assert result.locks[0].node_id == "abcdef012345"
     assert result.locks[0].supported is True
-    assert session.get.call_args_list[3].args[0].endswith("/v1.1/iot-03/devices/lock-example")
+    assert session.get.call_args_list[3].args[0].endswith("/v2.0/cloud/thing/lock-example")
     assert not hasattr(result.locks[0], "local_key")
 
 
@@ -419,9 +668,11 @@ async def test_child_details_must_identify_requested_device(details):
         response([child(name=None)]),
         response(details),
     )
-    with pytest.raises(cloud.CloudError):
+    with pytest.raises(cloud.CloudError) as error:
         await discover(session)
     assert session.get.call_count == 4
+    assert error.value.stage == "child_details"
+    assert error.value.reason == "invalid_child"
 
 
 async def test_named_child_with_missing_product_id_reads_verified_details():
@@ -449,7 +700,7 @@ async def test_named_child_with_missing_product_id_reads_verified_details():
     assert lock.node_id == "abcdef012345"
     assert lock.supported is True
     assert not hasattr(lock, "local_key")
-    assert session.get.call_args_list[3].args[0].endswith("/v1.1/iot-03/devices/lock-example")
+    assert session.get.call_args_list[3].args[0].endswith("/v2.0/cloud/thing/lock-example")
 
 
 @pytest.mark.parametrize("product_id", [None, 123, {}, "", " ahz7wpy9", "../ahz7wpy9"])

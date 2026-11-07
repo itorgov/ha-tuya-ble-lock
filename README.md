@@ -2,7 +2,7 @@
 
 Open compatible Tuya Bluetooth drawer and cabinet locks from Home Assistant, including from a dashboard or a wireless-button automation. Each lock gets its own device page, unlock control, battery level, and reported locked/unlocked state.
 
-You need **Home Assistant 2026.10 or newer**, a compatible lock, and a **Wi-Fi/Bluetooth gateway** (also called a hub). The gateway connects the Bluetooth locks to your home network. Home Assistant does not need a Bluetooth adapter.
+You need **Home Assistant 2026.11.0 or newer**, a compatible lock, and a **Wi-Fi/Bluetooth gateway** (also called a hub). The gateway connects the Bluetooth locks to your home network. Home Assistant does not need a Bluetooth adapter.
 
 ```text
 Home Assistant → home network → gateway → Bluetooth lock
@@ -54,7 +54,7 @@ Follow these sections in order. If your devices already work through the gateway
 
 Choose **one** method. Installation makes Tuya BLE Lock available in Home Assistant; you will add your gateway and locks afterward.
 
-#### Home Assistant 2026.11 or newer: Marketplace
+#### Marketplace
 
 The Marketplace is built into Home Assistant and replaces HACS. Use an administrator account.
 
@@ -67,20 +67,8 @@ The Marketplace is built into Home Assistant and replaces HACS. Use an administr
 
 See the [official Marketplace guide](https://www.home-assistant.io/integrations/marketplace/#custom-repositories). If upgrading from HACS, existing installations migrate automatically; you do not need to add them again.
 
-#### Home Assistant 2026.10: HACS
-
-HACS is the community integration manager used before the Marketplace. If you do not have it on Home Assistant 2026.10, follow the [HACS installation and setup guide](https://www.hacs.xyz/docs/use/).
-
-1. Open **HACS** in Home Assistant.
-2. Open its **⋮** menu → **Custom repositories**.
-3. Enter `https://github.com/itorgov/ha-tuya-ble-lock`, choose type **Integration**, and select **Add**.
-4. Find **Tuya BLE Lock** in HACS, open it, and select **Download**.
-5. Restart Home Assistant.
-
-See the [HACS custom-repository guide](https://www.hacs.xyz/docs/faq/custom_repositories/) if the menu is unfamiliar.
-
 <details>
-<summary>Manual installation without HACS</summary>
+<summary>Manual installation without the Marketplace</summary>
 
 1. On [this repository's GitHub page](https://github.com/itorgov/ha-tuya-ble-lock), choose **Code → Download ZIP** and extract it on your computer.
 2. Open the **Home Assistant configuration folder** on the machine running Home Assistant. This is the folder containing `configuration.yaml`, normally `/config` on Home Assistant OS.
@@ -112,9 +100,11 @@ If you already have a project linked to the correct app account, reuse it. Check
 1. Register or sign in at the [Tuya Developer Platform](https://platform.tuya.com/).
 2. Open **Cloud → Development** (sometimes **Project Management**) → **Create Cloud Project**. Give it a name and choose development method **Smart Home**.
 3. Choose the **data center**, meaning the Tuya server region that holds your app account's devices. Find the account region in the phone app under **Me → Settings → Account and Security → Region**, then use [Tuya's region table](https://developer.tuya.com/en/docs/iot/oem-app-data-center-distributed?id=Kafi0ku9l07qb). Your current physical location is not necessarily the account region.
-4. Authorize the services offered by the Smart Home wizard: **Industry Basic Service**, **Smart Home Basic Service**, and **Device Status Notification**. See [Tuya's project-creation guide](https://developer.tuya.com/en/docs/iot/Platform_Configuration_smarthome?id=Kamcgamwoevrx).
+4. Open the project's **Service API** tab. Check that **IoT Core** is authorized and its trial or subscription has not expired. If authorization is missing, use **Go to Authorize**. If the service is unavailable, open **Cloud → Cloud Services**, find IoT Core, and activate an available trial or subscription before authorizing the project. See [Tuya's service-permission guide](https://developer.tuya.com/en/docs/iot/applying-for-api-group-permissions?id=Ka6vf012u6q76).
 5. In the project, open **Devices → Link Tuya App Account → Add App Account**. Scan the QR code with the scanner **inside Tuya Smart or Smart Life**, using the same account that owns the devices, and confirm on the phone.
 6. Choose automatic device linking if offered. If you choose devices manually, include the gateway and every intended lock. Open **All Devices**, select the correct data center, and check that they appear. See [Tuya's account-linking guide](https://developer.tuya.com/en/docs/iot/link-devices?id=Ka471nu1sfmkl).
+
+Some older Smart Home setup screens also offer **Industry Basic Service**, **Smart Home Basic Service**, and **Device Status Notification**. Accept the wizard's offered authorizations if they appear. The service list varies; these names are not mandatory separate menu items, and your project may list only IoT Core.
 
 Keep these values handy, preferably in a password manager:
 
@@ -127,7 +117,7 @@ Keep these values handy, preferably in a password manager:
 
 These are **not** your mobile-app login and password. Home Assistant does not save the project credentials, so you will need them again when discovering additional locks.
 
-If Tuya reports missing permissions, open the project's **Service API → Go to Authorize**. Check that the required services are both available to your account and authorized for this project; device access may be listed under **IoT Core**, and token access under **Authorization**. Tuya's [service-permission guide](https://developer.tuya.com/en/docs/iot/applying-for-api-group-permissions?id=Ka6vf012u6q76) explains the two steps. Service names, trial periods, and availability can vary. Expired cloud access prevents discovery but does not by itself stop already configured local unlocks.
+Discovery needs permission to read gateway details, its linked locks, and each lock's supported commands. An active IoT Core subscription does not guarantee access to every query. If setup reports a permission error, use the failed step and error code to check the corresponding service's subscription and project authorization; see [troubleshooting](#troubleshooting). Expired cloud access prevents discovery but does not by itself stop already configured local unlocks.
 
 ### Collect the gateway address and each lock's unlock information
 
@@ -143,7 +133,7 @@ You do not need to decode that value or understand the term *Base64*. You will p
 
 1. Open **Settings → Devices & services → Add integration** and search for **Tuya BLE Lock**.
 2. Choose **Discover locks with Tuya Cloud**.
-3. On **Read gateway details from Tuya**, enter the four values from the [cloud-access table](#prepare-tuya-cloud-access). Check **Project data center** carefully: the form initially selects **Central Europe**, which may be wrong for your account. Select **Submit**.
+3. On **Read gateway details from Tuya**, enter the four values from the [cloud-access table](#prepare-tuya-cloud-access). Check **Project data center** carefully: each new setup starts with **Central Europe**, which may be wrong for your account. Retries in the same setup keep your selected region. Select **Submit**.
 4. On **Connect to the local gateway**, fill in:
 
    | Field | What to enter |
@@ -189,7 +179,7 @@ Use this when your gateway already appears under **Tuya BLE Lock** in Home Assis
 2. **On the Tuya website:** open your existing project → **Devices → All Devices**. Confirm the new locks appear in the correct data center. If your app account uses manual device linking, include the new locks in that linked account's device selection.
 3. Obtain [unlock information](docs/remote-unlock-code.md) for each **new** lock. Have the project's Access ID, Access Secret, and data center ready too; reuse the same project.
 4. **In Home Assistant:** open **Settings → Devices & services → Tuya BLE Lock**. Find the existing gateway under **Hubs**. Open the **⋮ menu on that gateway's integration entry** and choose **Reconfigure**. Use the gateway entry, not an individual lock's device page.
-5. Choose **Discover locks with Tuya Cloud**. Enter the Access ID and Secret again and select the correct **Project data center**; it defaults to Central Europe each time. The gateway ID is already saved, so this form does not ask for it again.
+5. Choose **Discover locks with Tuya Cloud**. Enter the Access ID and Secret again and select the correct **Project data center**. A new Reconfigure dialog starts with Central Europe; retries within it keep your selected region. The gateway ID is already saved, so this form does not ask for it again.
 6. On **Connect to the local gateway**, keep the saved gateway name, address, and protocol version unless they changed. Leave **Gateway Local Key** blank and submit.
 7. Select the new locks on **Select discovered locks**. Existing locks are deliberately omitted from this list; they keep their settings.
 8. Complete [the lock form](#fill-in-the-lock-form) for each new lock, then select **Save** in **Manage locks**.
@@ -245,17 +235,19 @@ To remove a lock from Home Assistant, use **Remove a lock from this integration*
 
 ## Update the integration
 
-For a Marketplace installation, install the update from **Settings → Updates**, then restart Home Assistant. On Home Assistant 2026.10, update through HACS. For a manual installation, replace the entire `custom_components/tuya_ble_lock` folder, then restart.
+For a Marketplace installation, install the update from **Settings → Updates**, then restart Home Assistant. For a manual installation, replace the entire `custom_components/tuya_ble_lock` folder, then restart.
 
 Keep the existing gateway entry; its settings, saved codes, and entity IDs are retained. Adding locks uses [Reconfigure](#add-more-locks-to-an-existing-gateway), not an integration update.
 
 ## Troubleshooting
 
+Cloud setup errors identify the step that failed, such as reading gateway details or checking a lock's supported commands. They also show a Tuya error code or HTTP status when available. Follow the accompanying guidance and include that step and code when asking for help; never include credentials or the full cloud response.
+
 | What you see | What to do |
 | --- | --- |
 | Tuya BLE Lock is missing from **Add integration** | Restart Home Assistant and refresh the browser after installation. For manual installation, check that `manifest.json` is directly inside `/config/custom_components/tuya_ble_lock/`. |
 | Tuya's device list is empty | Check the linked phone-app account and data center. The project must contain the gateway and the locks you want to add. |
-| Cloud login or permission error | Use the project's Access ID/Secret, not your app password. Re-select the correct data center; check service authorization and trial/subscription status. |
+| Cloud login or permission error | Use the project's Access ID/Secret, not your app password. Check the selected data center, linked app account, and service authorization for the failed step. If the error reports an expired subscription or exhausted quota, review that service in the Tuya project before retrying. |
 | **No new compatible locks found**, or setup goes straight to **Manage locks** | Check that each new lock appears under this gateway in the phone app and in the cloud project. Already configured locks are omitted. A failure to read one lock's details can omit that lock; retry discovery after fixing permissions. Unsupported models are not made compatible by entering their IDs manually. |
 | **This gateway is already configured** | Close the add-integration flow. Use the existing gateway's **⋮ → Reconfigure**. |
 | Only **Polling interval** appears | Close **Configure** and use **⋮ → Reconfigure** to add or edit locks. |
@@ -311,7 +303,12 @@ For a new gateway, choose **Add integration → Tuya BLE Lock → Enter local ga
 
 After the gateway check, choose **Add a lock manually**. Enter its name, **Lock device ID**, and **Exact child node_id**. The last value is the lock's identifier inside that gateway; it is different from the Device ID and must be copied exactly, not guessed from a Bluetooth MAC address. Complete [the lock form](#fill-in-the-lock-form), repeat for other locks, then choose **Save**.
 
-Missing values can be read through the Tuya project's **API Explorer**: gateway device details include `local_key`; gateway sub-device queries provide each child's Device ID and `node_id`. See [Tuya's device-information API](https://developer.tuya.com/en/docs/cloud/7d3f13ae55?id=Kb2rzcwpmvaci). A cloud-reported `ip` may be a public address, so obtain the local address from your router.
+To retrieve missing values, open **Cloud → API Explorer** and select your project and its data center:
+
+- **Gateway Local Key:** select **IoT Core → Device Management → Query Device Details** (`GET /v2.0/cloud/thing/{device_id}`). Enter the gateway's Device ID, run the query, and copy `local_key` from `result`. See [Tuya's Query Device Details reference](https://developer.tuya.com/en/docs/cloud/3829469013?id=Kcp2l2v9wma0m).
+- **Lock identifiers:** find **Get the list of sub-devices**, documented at `GET /v1.0/iot-03/devices/{device_id}/sub-devices`. Enter the **gateway's** Device ID. For each lock in `result`, copy `id` as its Lock device ID and `node_id` as its child identifier. This is an older API and may require separate service access; see [Tuya's sub-device reference](https://developer.tuya.com/en/docs/cloud/ac516a1e3a?id=Kag2y1eyp1xck).
+
+A cloud-reported `ip` may be a public address, so obtain the local address from your router. Keep the Local Key private and copy its value without JSON quotes.
 
 ### Compatibility details
 
