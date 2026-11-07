@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -310,37 +311,54 @@ def _product_id(value: Any) -> str | None:
     return value if isinstance(value, str) and _DEVICE_ID.fullmatch(value) else None
 
 
-def _supports_unlock(specification: Any) -> bool:
-    """Require the exact writable Raw DP 61, never infer a DP from its name."""
-    if not isinstance(specification, dict):
+def _unique_model_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject ambiguous JSON fields instead of silently choosing the last value."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate model field")
+        result[key] = value
+    return result
+
+
+def _supports_model(result: Any) -> bool:
+    """Require writable raw DP61 in one unambiguous default-service model."""
+    if not isinstance(result, dict) or not isinstance(result.get("model"), str):
         return False
-    functions = specification.get("functions")
-    if not isinstance(functions, list):
+    try:
+        model = json.loads(result["model"], object_pairs_hook=_unique_model_object)
+    except ValueError, RecursionError:
+        return False
+    if not isinstance(model, dict) or not isinstance(model.get("services"), list):
+        return False
+    services = model["services"]
+    if any(not isinstance(service, dict) for service in services):
+        return False
+    default_services = [service for service in services if service.get("code") == ""]
+    if len(default_services) != 1:
+        return False
+    properties = default_services[0].get("properties")
+    if not isinstance(properties, list):
         return False
     matching = []
-    for function in functions:
-        if not isinstance(function, dict):
+    for property_definition in properties:
+        if not isinstance(property_definition, dict):
             return False
-        # Tuya documents dp_id, but also uses dpId in its response example.
-        dp_id = function.get("dp_id", function.get("dpId"))
-        if function.get("code") == "remote_no_dp_key" or dp_id in (61, "61"):
-            matching.append(function)
+        if property_definition.get("code") == "remote_no_dp_key" or property_definition.get(
+            "abilityId"
+        ) in (61, "61"):
+            matching.append(property_definition)
     if len(matching) != 1:
         return False
-    function = matching[0]
-    dp_id = function.get("dp_id", function.get("dpId"))
-    dp_type = function.get("type")
+    property_definition = matching[0]
+    type_spec = property_definition.get("typeSpec")
     return (
-        type(dp_id) in (int, str)
-        and dp_id in (61, "61")
-        and function.get("code") == "remote_no_dp_key"
-        and isinstance(dp_type, str)
-        and dp_type.lower() == "raw"
-        and not (
-            "dp_id" in function
-            and "dpId" in function
-            and str(function["dp_id"]) != str(function["dpId"])
-        )
+        type(property_definition.get("abilityId")) is int
+        and property_definition["abilityId"] == 61
+        and property_definition.get("code") == "remote_no_dp_key"
+        and property_definition.get("accessMode") in ("rw", "wr")
+        and isinstance(type_spec, dict)
+        and type_spec.get("type") == "raw"
     )
 
 
@@ -401,9 +419,7 @@ async def async_discover_gateway(
             reason="invalid_local_key",
         )
 
-    children = await client.get(
-        f"/v1.0/iot-03/devices/{gateway_id}/sub-devices", stage="gateway_children"
-    )
+    children = await client.get(f"/v1.0/devices/{gateway_id}/sub-devices", stage="gateway_children")
     if not isinstance(children, list):
         raise CloudError(
             "Tuya did not return a valid list of gateway children",
@@ -467,8 +483,8 @@ async def async_discover_gateway(
                 display_metadata = {**child, **details}
         if reason is None:
             try:
-                specification = await client.get(
-                    f"/v1.1/devices/{device_id}/specifications", stage="child_specification"
+                model = await client.get(
+                    f"/v2.0/cloud/thing/{device_id}/model", stage="child_specification"
                 )
             except CloudAuthError:
                 raise
@@ -477,7 +493,7 @@ async def async_discover_gateway(
                     raise
                 reason = "specification_unavailable"
             else:
-                reason = None if _supports_unlock(specification) else "unsupported_profile"
+                reason = None if _supports_model(model) else "unsupported_profile"
         locks.append(
             DiscoveredLock(
                 device_id=device_id,

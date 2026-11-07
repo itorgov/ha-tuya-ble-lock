@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import json
 import traceback
-from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -54,9 +54,32 @@ def child(**changes):
     }
 
 
-def specification(**changes):
-    """Return a supported writable DP profile."""
-    return {"functions": [{"dp_id": 61, "code": "remote_no_dp_key", "type": "Raw", **changes}]}
+def model_property(**changes):
+    """Return a synthetic writable DP61 property in the modern model format."""
+    return {
+        "abilityId": 61,
+        "code": "remote_no_dp_key",
+        "accessMode": "rw",
+        "typeSpec": {"type": "raw"},
+        **changes,
+    }
+
+
+def model_result(properties=None, **service_changes):
+    """Return the JSON-string model envelope used by IoT Core."""
+    return {
+        "model": json.dumps(
+            {
+                "services": [
+                    {
+                        "code": "",
+                        "properties": properties if properties is not None else [model_property()],
+                        **service_changes,
+                    }
+                ]
+            }
+        )
+    }
 
 
 async def discover(session, **changes):
@@ -80,7 +103,7 @@ async def test_discovery_signs_read_only_requests_and_preserves_node_id(monkeypa
         response({"access_token": "test-token", "refresh_token": "discard-me"}),
         response(gateway()),
         response([child()]),
-        response(specification()),
+        response(model_result()),
     )
 
     result = await discover(session)
@@ -98,8 +121,8 @@ async def test_discovery_signs_read_only_requests_and_preserves_node_id(monkeypa
     assert [request.args[0] for request in requests] == [
         "https://openapi.tuyaeu.com/v1.0/token?grant_type=1",
         "https://openapi.tuyaeu.com/v2.0/cloud/thing/gateway-example",
-        "https://openapi.tuyaeu.com/v1.0/iot-03/devices/gateway-example/sub-devices",
-        "https://openapi.tuyaeu.com/v1.1/devices/lock-example/specifications",
+        "https://openapi.tuyaeu.com/v1.0/devices/gateway-example/sub-devices",
+        "https://openapi.tuyaeu.com/v2.0/cloud/thing/lock-example/model",
     ]
     assert requests[0].kwargs["headers"] == {
         "client_id": "test-client",
@@ -121,6 +144,52 @@ async def test_discovery_signs_read_only_requests_and_preserves_node_id(monkeypa
     assert "lock-example" not in repr(result.locks[0])
     assert not hasattr(result, "access_token")
     assert not hasattr(result, "client_secret")
+
+
+async def test_smart_home_children_and_iot_core_models_discover_all_four_locks():
+    """Follow the verified cloud schemas without requesting legacy Industry APIs."""
+    children = [
+        {
+            "active_time": 1_700_000_000,
+            "category": "ms",
+            "icon": "smart/example.png",
+            "id": f"example-lock-{index}",
+            "name": f"Example lock {index}",
+            "node_id": f"example-node-{index}",
+            "online": index % 2 == 0,
+            "owner_id": "synthetic-owner",
+            "product_id": "ahz7wpy9",
+            "update_time": 1_700_000_100,
+        }
+        for index in range(4)
+    ]
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway(sub=True)),
+        response(children),
+        *(
+            response(model_result([model_property(typeSpec={"type": "raw", "maxlen": 128})]))
+            for _ in children
+        ),
+    )
+
+    result = await discover(session)
+
+    assert [(lock.device_id, lock.node_id, lock.name) for lock in result.locks] == [
+        (child["id"], child["node_id"], child["name"]) for child in children
+    ]
+    assert all(lock.supported and lock.product_id == "ahz7wpy9" for lock in result.locks)
+    urls = [call.args[0] for call in session.get.call_args_list]
+    assert urls == [
+        "https://openapi.tuyaeu.com/v1.0/token?grant_type=1",
+        "https://openapi.tuyaeu.com/v2.0/cloud/thing/gateway-example",
+        "https://openapi.tuyaeu.com/v1.0/devices/gateway-example/sub-devices",
+        *(f"https://openapi.tuyaeu.com/v2.0/cloud/thing/{child['id']}/model" for child in children),
+    ]
+    assert all("iot-03" not in url and "/specifications" not in url for url in urls)
+    session.post.assert_not_called()
+    session.put.assert_not_called()
+    session.delete.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -397,7 +466,7 @@ async def test_gateway_reporting_sub_true_can_proceed_to_local_verification():
         response({"access_token": "test-token"}),
         response(gateway(sub=True)),
         response([child()]),
-        response(specification()),
+        response(model_result()),
     )
 
     result = await discover(session)
@@ -429,7 +498,7 @@ async def test_other_children_are_not_automatically_classified_as_supported_lock
         response({"access_token": "test-token"}),
         response(gateway()),
         response([child(category="dj", name="Example bulb")]),
-        response({"functions": [{"dp_id": 61, "code": "switch", "type": "Boolean"}]}),
+        response(model_result([model_property(code="switch", typeSpec={"type": "bool"})])),
     )
     result = await discover(session)
     assert result.locks[0].supported is False
@@ -459,9 +528,9 @@ async def test_child_lookup_failure_preserves_verified_siblings(stage, failure):
         response({"access_token": "test-token"}),
         response(gateway()),
         response([child(), failed_child, child(id="last-lock", node_id="thirdnode")]),
-        response(specification()),
+        response(model_result()),
         failed_response,
-        response(specification()),
+        response(model_result()),
     )
 
     result = await discover(session)
@@ -476,10 +545,10 @@ async def test_child_lookup_failure_preserves_verified_siblings(stage, failure):
     expected_path = (
         "/v2.0/cloud/thing/unverified-child"
         if stage == "metadata"
-        else "/v1.1/devices/unverified-child/specifications"
+        else "/v2.0/cloud/thing/unverified-child/model"
     )
     assert session.get.call_args_list[4].args[0].endswith(expected_path)
-    assert session.get.call_args_list[5].args[0].endswith("/last-lock/specifications")
+    assert session.get.call_args_list[5].args[0].endswith("/last-lock/model")
     assert session.get.call_count == 6
 
 
@@ -592,7 +661,7 @@ async def test_unverified_child_cannot_hide_a_conflicting_node_id():
 async def test_conflicting_or_malformed_children_fail_closed(children, reason):
     responses = [response({"access_token": "test-token"}), response(gateway()), response(children)]
     if isinstance(children, list) and len(children) > 1:
-        responses.append(response(specification()))
+        responses.append(response(model_result()))
     session = session_with(*responses)
     with pytest.raises(cloud.CloudError) as error:
         await discover(session)
@@ -600,36 +669,104 @@ async def test_conflicting_or_malformed_children_fail_closed(children, reason):
     assert error.value.reason == reason
 
 
+@pytest.mark.parametrize("access_mode", ["rw", "wr"])
+def test_modern_model_supports_exact_writable_raw_dp61(access_mode):
+    result = model_result(
+        [
+            {"abilityId": 8, "code": "battery", "accessMode": "ro", "typeSpec": {"type": "value"}},
+            model_property(accessMode=access_mode),
+        ]
+    )
+    assert cloud._supports_model(result) is True
+
+
 @pytest.mark.parametrize(
-    "specification_value",
+    "changes",
+    [
+        {"abilityId": None},
+        {"abilityId": 62},
+        {"abilityId": "61"},
+        {"abilityId": 61.0},
+        {"abilityId": True},
+        {"code": "another_code"},
+        {"code": None},
+        {"accessMode": "ro"},
+        {"accessMode": "RW"},
+        {"accessMode": None},
+        {"typeSpec": None},
+        {"typeSpec": "raw"},
+        {"typeSpec": {}},
+        {"typeSpec": {"type": "Raw"}},
+        {"typeSpec": {"type": "string"}},
+    ],
+)
+def test_modern_model_requires_the_exact_property_identity_and_write_access(changes):
+    assert cloud._supports_model(model_result([model_property(**changes)])) is False
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        [],
+        {},
+        [None],
+        [model_property(), None],
+        [model_property(), model_property()],
+        [model_property(), model_property(abilityId=62)],
+        [model_property(), model_property(code="different_property")],
+        [model_property(), model_property(abilityId="61", code="different_property")],
+    ],
+)
+def test_modern_model_rejects_invalid_or_conflicting_properties(properties):
+    assert cloud._supports_model(model_result(properties)) is False
+
+
+@pytest.mark.parametrize(
+    "services",
+    [
+        None,
+        {},
+        [],
+        [None],
+        [{"properties": [model_property()]}],
+        [{"code": "named_service", "properties": [model_property()]}],
+        [{"code": "", "properties": None}],
+        [{"code": "", "actions": [model_property()], "properties": []}],
+        [{"code": "", "events": [model_property()], "properties": []}],
+        [
+            {"code": "", "properties": [model_property()]},
+            {"code": "", "properties": []},
+        ],
+    ],
+)
+def test_modern_model_requires_one_default_service_with_properties(services):
+    assert cloud._supports_model({"model": json.dumps({"services": services})}) is False
+
+
+@pytest.mark.parametrize(
+    "result",
     [
         None,
         [],
         {},
-        {"functions": []},
-        {"functions": [None]},
-        {"status": specification()["functions"]},
-        specification(dp_id=None),
-        specification(dp_id=49),
-        specification(dp_id=61.0),
-        specification(dp_id=True),
-        specification(code="another_code"),
-        specification(type="String"),
-        specification(dpId=49),
-        {"functions": specification()["functions"] * 2},
+        {"model": None},
+        {"model": {}},
+        {"model": "not-json"},
+        {"model": "null"},
+        {"model": "[]"},
+        {"model": "{}"},
+        {"model": '{"services": [], "services": []}'},
+        {"model": "[" * 2000 + "]" * 2000},
     ],
 )
-def test_unknown_or_conflicting_dp_profiles_are_unsupported(specification_value):
-    assert cloud._supports_unlock(specification_value) is False
+def test_modern_model_rejects_malformed_or_ambiguous_json(result):
+    assert cloud._supports_model(result) is False
 
 
-@pytest.mark.parametrize("dp_field", ["dp_id", "dpId"])
-@pytest.mark.parametrize("dp_id", [61, "61"])
-def test_documented_dp_id_spellings_are_supported(dp_field, dp_id):
-    value = deepcopy(specification())
-    value["functions"][0].pop("dp_id")
-    value["functions"][0][dp_field] = dp_id
-    assert cloud._supports_unlock(value) is True
+def test_modern_model_rejects_duplicate_property_fields_in_json():
+    result = model_result()
+    result["model"] = result["model"].replace('"abilityId": 61', '"abilityId": 62, "abilityId": 61')
+    assert cloud._supports_model(result) is False
 
 
 @pytest.mark.asyncio
@@ -648,7 +785,7 @@ async def test_missing_child_name_is_loaded_from_verified_device_details(missing
                 "local_key": "discard-this-secret",
             }
         ),
-        response(specification()),
+        response(model_result()),
     )
     result = await discover(session)
     assert result.locks[0].name == "Hallway lock"
@@ -691,7 +828,7 @@ async def test_named_child_with_missing_product_id_reads_verified_details():
                 "local_key": "discard-this-secret",
             }
         ),
-        response(specification()),
+        response(model_result()),
     )
     result = await discover(session)
     lock = result.locks[0]
@@ -711,7 +848,7 @@ async def test_malformed_product_metadata_cannot_select_a_known_profile(product_
         response(gateway()),
         response([child(product_id=product_id)]),
         response({"id": "lock-example", "product_id": product_id}),
-        response(specification()),
+        response(model_result()),
     )
     result = await discover(session)
     assert result.locks[0].product_id is None
@@ -726,7 +863,7 @@ async def test_child_without_any_name_uses_unambiguous_fallback():
         response(gateway()),
         response([child(name=None)]),
         response({"id": "lock-example"}),
-        response(specification()),
+        response(model_result()),
     )
     result = await discover(session)
     assert result.locks[0].name == "Tuya device lock-example"

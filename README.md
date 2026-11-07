@@ -306,13 +306,31 @@ After the gateway check, choose **Add a lock manually**. Enter its name, **Lock 
 To retrieve missing values, open **Cloud → API Explorer** and select your project and its data center:
 
 - **Gateway Local Key:** select **IoT Core → Device Management → Query Device Details** (`GET /v2.0/cloud/thing/{device_id}`). Enter the gateway's Device ID, run the query, and copy `local_key` from `result`. See [Tuya's Query Device Details reference](https://developer.tuya.com/en/docs/cloud/3829469013?id=Kcp2l2v9wma0m).
-- **Lock identifiers:** find **Get the list of sub-devices**, documented at `GET /v1.0/iot-03/devices/{device_id}/sub-devices`. Enter the **gateway's** Device ID. For each lock in `result`, copy `id` as its Lock device ID and `node_id` as its child identifier. This is an older API and may require separate service access; see [Tuya's sub-device reference](https://developer.tuya.com/en/docs/cloud/ac516a1e3a?id=Kag2y1eyp1xck).
+- **Lock identifiers:** find **Query Zigbee devices under the gateway** (`GET /v1.0/devices/{deviceId}/sub-devices`). This query also returns Bluetooth locks on the supported gateway. Enter the **gateway's** Device ID. For each lock in `result`, copy `id` as its Lock device ID and `node_id` as its child identifier. See [Tuya's sub-device reference](https://developer.tuya.com/en/docs/cloud/fd92a062fa?id=Kd30e9f9fm3w6).
 
 A cloud-reported `ip` may be a public address, so obtain the local address from your router. Keep the Local Key private and copy its value without JSON quotes.
 
 ### Compatibility details
 
-The supported unlock format is **HX201-style DP61**, named `remote_no_dp_key`, with an existing eight-digit remote code. Discovery looks for that command in Tuya's device information; a Tuya logo or a similar product name alone does not establish support. See the [command-format reference](docs/remote-unlock-code.md) and [hardware-support guidance](CONTRIBUTING.md).
+The supported unlock format is **HX201-style DP61**, named `remote_no_dp_key`, with an existing eight-digit remote code. Discovery checks Tuya's **device model**, which describes the commands and readings a lock supports. It requires the exact writable unlock command; a Tuya logo or a similar product name alone does not establish support. See the [command-format reference](docs/remote-unlock-code.md) and [hardware-support guidance](CONTRIBUTING.md).
+
+<details>
+<summary>Check a lock's command definition in Tuya</summary>
+
+In **Cloud → API Explorer**, select your project and data center, then **IoT Core → Device Control → Query Things Data Model**. Enter the **lock's Device ID** and run `GET /v2.0/cloud/thing/{device_id}/model`.
+
+The response's `result.model` contains the definition as JSON text. Inside `services`, find the default service (`code` is an empty string). Its `properties` list must contain one unambiguous entry with all these fields:
+
+| Field | Required value |
+| --- | --- |
+| `abilityId` | The number `61` |
+| `code` | `remote_no_dp_key` |
+| `accessMode` | `rw` or `wr`, allowing commands to be sent |
+| `typeSpec.type` | `raw`, meaning Base64-encoded binary data |
+
+See [Tuya's model API reference](https://developer.tuya.com/en/docs/cloud/bd68171262?id=Kcp4utbhzzfgo). This query checks the command definition; obtain the existing unlock credential separately through the [unlock-information guide](docs/remote-unlock-code.md).
+
+</details>
 
 The known T1 / HX201 profile reports state through **DP40**. Other compatible locks use **Standard lock state (DP47)** if they report their motor state that way. Manual setup defaults to DP47, so select DP40 explicitly for the supported T1. LAN protocols 3.3 and 3.4 are configurable but have not been verified on hardware with this integration.
 
