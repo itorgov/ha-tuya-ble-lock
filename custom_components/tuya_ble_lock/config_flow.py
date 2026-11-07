@@ -1,10 +1,10 @@
 """UI setup, gateway reconfiguration and per-lock credential management."""
 
-import base64
-import binascii
 import ipaddress
 import re
+import time
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 import probatio as vol
@@ -15,10 +15,21 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlowWithReload,
 )
-from homeassistant.const import CONF_DEVICE_ID, CONF_HOST, CONF_NAME, CONF_SCAN_INTERVAL
+from homeassistant.const import (
+    ATTR_AREA_ID as CONF_AREA_ID,
+)
+from homeassistant.const import (
+    CONF_DEVICE_ID,
+    CONF_HOST,
+    CONF_NAME,
+    CONF_SCAN_INTERVAL,
+)
 from homeassistant.core import callback
+from homeassistant.data_entry_flow import UnknownFlow
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    AreaSelector,
     BooleanSelector,
     SelectSelector,
     SelectSelectorConfig,
@@ -27,8 +38,9 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from .cloud import CloudAuthError, CloudError, async_discover_gateway
+from .cloud import CloudAuthError, CloudError, async_discover_gateway, async_read_unlock_credential
 from .const import (
+    CONF_AREAS,
     CONF_GATEWAY_ID,
     CONF_LOCAL_KEY,
     CONF_LOCKS,
@@ -47,9 +59,11 @@ from .const import (
     STATE_SOURCE_HX201_DP40,
     STATE_SOURCE_MOTOR_DP47,
 )
+from .credentials import decode_unlock_command
 from .local import GatewayClient, LocalError, Topology, build_unlock
 
 _PASSWORD = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+_AUTOMATIC_GATEWAY_VERSIONS = {"csvxfq3ecmedidkh": "3.5"}
 _REGIONS = {
     "cn": "China",
     "us": "Western America",
@@ -66,6 +80,7 @@ _CLOUD_STAGES = {
     "gateway_children": "listing the gateway's locks",
     "child_details": "reading a lock's details",
     "child_specification": "checking a lock's supported commands",
+    "unlock_logs": "reading a lock's recent unlock commands",
 }
 _CLOUD_REASONS = {
     "connection": "Cannot reach Tuya. Check Home Assistant's internet connection and DNS, then retry.",
@@ -82,6 +97,7 @@ _CLOUD_REASONS = {
     "invalid_children": "Tuya returned an invalid gateway device list. Check the locks are linked to this gateway in the app, then retry.",
     "conflicting_children": "Tuya returned conflicting lock identities. Check the gateway's device list in the app, then retry.",
     "invalid_child": "Tuya returned an invalid lock identity. Check the gateway's device list and linked app account, then retry.",
+    "incomplete_logs": "Tuya returned incomplete command history. Unlock this lock once in the app, then retry.",
 }
 # Fixed guidance for documented Tuya codes; never display the vendor's message.
 # https://developer.tuya.com/en/docs/iot/error-code?id=K989ruxx88swc
@@ -126,6 +142,15 @@ _CLOUD_CODE_DETAILS = {
     "1108": "Tuya rejected the API address. Check the selected data center and integration version; report this code if it persists.",
     "1114": "Check the project's cloud authorization IP allowlist: it must permit the public IP used by Home Assistant.",
 }
+
+
+@dataclass(frozen=True, repr=False)
+class _CloudAccess:
+    """Discovery credentials retained only for the lifetime of this setup flow."""
+
+    region: str
+    client_id: str
+    client_secret: str
 
 
 def _cloud_error_details(error: CloudError) -> dict[str, str] | None:
@@ -201,14 +226,8 @@ def _credentials(data: dict[str, Any], previous: dict[str, Any]) -> dict[str, An
     if data.get("clear_code"):
         code = None
     if not data.get("clear_code") and (payload := data.get(CONF_PAYLOAD)):
-        try:
-            raw = base64.b64decode(payload, validate=True)
-            if len(raw) != 13 or raw[0] != 1 or raw[-2:] != b"\x00\x00":
-                raise ValueError("Invalid command layout")
-            member = int.from_bytes(raw[1:3], "big")
-            code = raw[3:11].decode("ascii")
-        except binascii.Error, UnicodeError:
-            raise ValueError("Invalid command encoding") from None
+        credential = decode_unlock_command(payload)
+        member, code = credential.member, credential.code
     if code is not None:
         build_unlock(member, code)
     elif type(member) is not int or not 1 <= member <= 65534:
@@ -230,7 +249,28 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
         self._pending: list[dict[str, Any]] = []
         self._editing: dict[str, Any] | None = None
         self._reconfigure = False
+        self._automatic = False
+        self._cloud_from_advanced = False
         self._cloud_region = "eu"
+        self._cloud_host = ""
+        self._cloud_access: _CloudAccess | None = None
+        self._auto_lock_ids: set[str] = set()
+        self._import_since_ms: dict[str, int] = {}
+        self._import_errors: dict[str, str] = {}
+        self._import_placeholders: dict[str, str] = {}
+        self._removed = False
+
+    @callback
+    def async_remove(self) -> None:
+        """Discard transient cloud access when setup completes or is cancelled."""
+        self._removed = True
+        self._cloud_access = None
+        self._auto_lock_ids.clear()
+        self._import_since_ms.clear()
+        self._import_errors.clear()
+        self._import_placeholders.clear()
+        self._pending.clear()
+        super().async_remove()
 
     @staticmethod
     @callback
@@ -243,10 +283,17 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_menu(step_id="user", menu_options=["cloud", "gateway"])
 
     async def async_step_cloud(self, user_input: dict | None = None) -> ConfigFlowResult:
-        """Read the selected gateway's key and children from Tuya once."""
+        """Read cloud metadata and verify the gateway without exposing technical settings."""
+        if user_input is None:
+            self._cloud_from_advanced = (
+                self.cur_step is not None and self.cur_step.get("step_id") == "manage"
+            )
+        self._automatic = True
         errors = {}
         placeholders = None
         if user_input is not None:
+            self._cloud_access = None
+            self._auto_lock_ids.clear()
             region = user_input.get("region")
             if type(region) is str and region in _REGIONS:
                 self._cloud_region = region
@@ -256,6 +303,8 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                 else user_input[CONF_GATEWAY_ID]
             )
             try:
+                host = str(ipaddress.IPv4Address(user_input[CONF_HOST]))
+                self._cloud_host = host
                 _identifier(gateway_id)
                 discovery = await async_discover_gateway(
                     async_get_clientsession(self.hass),
@@ -265,6 +314,8 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                     gateway_id,
                 )
             except CloudError as error:
+                if self._removed:
+                    raise UnknownFlow from None
                 placeholders = _cloud_error_details(error)
                 errors["base"] = (
                     "cloud_request_failed"
@@ -274,14 +325,50 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                     else "cloud_error"
                 )
             except ValueError:
-                errors["base"] = "invalid_input"
+                errors["base"] = "invalid_automatic_input"
             else:
-                self._data.update(
-                    {CONF_GATEWAY_ID: discovery.gateway_id, CONF_LOCAL_KEY: discovery.local_key}
+                if self._removed:
+                    raise UnknownFlow
+                version = self._data.get(CONF_VERSION) or _AUTOMATIC_GATEWAY_VERSIONS.get(
+                    discovery.product_id
                 )
-                self._data.setdefault(CONF_NAME, discovery.name or "Tuya Bluetooth gateway")
-                self._discovered = list(discovery.locks)
-                return await self.async_step_gateway()
+                if version is None:
+                    errors["base"] = "automatic_gateway_unsupported"
+                else:
+                    candidate = {
+                        **self._data,
+                        CONF_NAME: self._data.get(CONF_NAME)
+                        or discovery.name
+                        or "Tuya BLE gateway",
+                        CONF_HOST: host,
+                        CONF_GATEWAY_ID: discovery.gateway_id,
+                        CONF_LOCAL_KEY: discovery.local_key,
+                        CONF_VERSION: version,
+                    }
+                    try:
+                        candidate = _validate_gateway(candidate)
+                        topology = await self._async_probe_gateway(candidate)
+                    except ValueError, UnicodeError, KeyError, TypeError:
+                        errors["base"] = "invalid_automatic_input"
+                    except LocalError:
+                        if self._removed:
+                            raise UnknownFlow from None
+                        errors["base"] = "cannot_connect_automatic"
+                    else:
+                        self._data = candidate
+                        self._topology = topology
+                        self._discovered = list(discovery.locks)
+                        self._cloud_access = _CloudAccess(
+                            user_input["region"],
+                            user_input["client_id"],
+                            user_input["client_secret"],
+                        )
+                        self._auto_lock_ids = {
+                            lock.device_id
+                            for lock in self._discovered
+                            if lock.supported and lock.product_id == HX201_PRODUCT_ID
+                        }
+                        return await self.async_step_select_locks()
         schema = {
             vol.Required("region", default=self._cloud_region): SelectSelector(
                 SelectSelectorConfig(
@@ -290,6 +377,7 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
             ),
             vol.Required(vol.Secret("client_id")): _PASSWORD,
             vol.Required(vol.Secret("client_secret")): _PASSWORD,
+            vol.Required(CONF_HOST, default=self._cloud_host or self._data.get(CONF_HOST, "")): str,
         }
         if CONF_GATEWAY_ID not in self._data:
             schema[vol.Required(CONF_GATEWAY_ID)] = str
@@ -302,6 +390,7 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_gateway(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Verify the local gateway using a read-only topology query."""
+        self._automatic = False
         errors = {}
         if user_input is not None:
             candidate = {**self._data, **user_input}
@@ -311,35 +400,16 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                 candidate[CONF_GATEWAY_ID] = self._data[CONF_GATEWAY_ID]
             try:
                 candidate = _validate_gateway(candidate)
-                await self.async_set_unique_id(candidate[CONF_GATEWAY_ID])
-                if not self._reconfigure:
-                    self._abort_if_unique_id_configured()
-                client = GatewayClient(
-                    candidate[CONF_HOST],
-                    candidate[CONF_GATEWAY_ID],
-                    candidate[CONF_LOCAL_KEY],
-                    float(candidate[CONF_VERSION]),
-                )
-                entry = self._get_reconfigure_entry() if self._reconfigure else None
-                coordinator = getattr(entry, "runtime_data", None)
-                if entry is not None and entry.state is ConfigEntryState.LOADED and coordinator:
-                    # Gateways may accept only one TCP connection. The running
-                    # coordinator owns that connection and serializes the read.
-                    self._topology = await coordinator.async_probe(
-                        client,
-                        reuse_connection=all(
-                            candidate[key] == entry.data[key]
-                            for key in (CONF_HOST, CONF_GATEWAY_ID, CONF_LOCAL_KEY, CONF_VERSION)
-                        ),
-                    )
-                else:
-                    self._topology = await self.hass.async_add_executor_job(client.probe)
+                topology = await self._async_probe_gateway(candidate)
             except ValueError, UnicodeError, KeyError, TypeError:
                 errors["base"] = "invalid_input"
             except LocalError:
+                if self._removed:
+                    raise UnknownFlow from None
                 errors["base"] = "cannot_connect"
             else:
                 self._data = candidate
+                self._topology = topology
                 if self._discovered:
                     return await self.async_step_select_locks()
                 return await self.async_step_manage()
@@ -360,6 +430,33 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
             step_id="gateway", data_schema=vol.Schema(fields), errors=errors
         )
 
+    async def _async_probe_gateway(self, candidate: dict[str, Any]) -> Topology:
+        """Share the existing connection when reconfiguring a loaded gateway."""
+        await self.async_set_unique_id(candidate[CONF_GATEWAY_ID])
+        if not self._reconfigure:
+            self._abort_if_unique_id_configured()
+        client = GatewayClient(
+            candidate[CONF_HOST],
+            candidate[CONF_GATEWAY_ID],
+            candidate[CONF_LOCAL_KEY],
+            float(candidate[CONF_VERSION]),
+        )
+        entry = self._get_reconfigure_entry() if self._reconfigure else None
+        coordinator = getattr(entry, "runtime_data", None)
+        if entry is not None and entry.state is ConfigEntryState.LOADED and coordinator:
+            topology = await coordinator.async_probe(
+                client,
+                reuse_connection=all(
+                    candidate[key] == entry.data[key]
+                    for key in (CONF_HOST, CONF_GATEWAY_ID, CONF_LOCAL_KEY, CONF_VERSION)
+                ),
+            )
+        else:
+            topology = await self.hass.async_add_executor_job(client.probe)
+        if self._removed:
+            raise UnknownFlow
+        return topology
+
     def _duplicate(self, device_id: str, node_id: str) -> bool:
         """Prevent duplicate children across gateways and within this gateway."""
         for lock in self._data[CONF_LOCKS]:
@@ -378,6 +475,7 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
             lock.device_id: lock
             for lock in self._discovered
             if lock.supported
+            and (not self._automatic or lock.device_id in self._auto_lock_ids)
             and lock.node_id in self._topology.online | self._topology.offline
             and not self._duplicate(lock.device_id, lock.node_id)
         }
@@ -405,10 +503,18 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                     }
                     for item in selected
                 ]
-                return await self.async_step_lock()
+                return await self._async_prepare_current_lock()
         if not candidates:
             self._discovered = []
-            return self.async_show_form(step_id="no_locks", data_schema=vol.Schema({}))
+            return self.async_show_form(
+                step_id="gateway_ready"
+                if self._automatic and self._data[CONF_LOCKS]
+                else "no_locks_manual"
+                if self._cloud_from_advanced
+                else "no_locks",
+                data_schema=vol.Schema({}),
+                last_step=not self._cloud_from_advanced or bool(self._data[CONF_LOCKS]),
+            )
         return self.async_show_form(
             step_id="select_locks",
             data_schema=vol.Schema(
@@ -425,13 +531,21 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
-            description_placeholders={
-                "unsupported": str(sum(not lock.supported for lock in self._discovered))
-            },
         )
 
     async def async_step_no_locks(self, user_input: dict | None = None) -> ConfigFlowResult:
-        """Allow manual setup when cloud metadata does not identify the profile."""
+        """Finish an empty automatic search without creating a gateway-only entry."""
+        if self._automatic:
+            return self.async_abort(reason="no_new_locks")
+        return await self.async_step_manage()
+
+    async def async_step_gateway_ready(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Save refreshed connection details while keeping existing locks unchanged."""
+        return await self.async_step_finish()
+
+    async def async_step_no_locks_manual(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Keep unsaved manual changes available after an empty cloud search."""
+        self._automatic = False
         return await self.async_step_manage()
 
     async def async_step_manage(self, user_input: dict | None = None) -> ConfigFlowResult:
@@ -490,18 +604,7 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
             except ValueError, LocalError:
                 errors["base"] = "invalid_credentials"
             else:
-                if self._editing is not None:
-                    self._data[CONF_LOCKS] = [
-                        updated if item[CONF_DEVICE_ID] == lock[CONF_DEVICE_ID] else item
-                        for item in self._data[CONF_LOCKS]
-                    ]
-                    self._editing = None
-                else:
-                    self._data[CONF_LOCKS].append(updated)
-                    self._pending.pop(0)
-                if self._pending:
-                    return await self.async_step_lock()
-                return await self.async_step_manage()
+                return await self._async_finish_current_lock(updated)
         return self.async_show_form(
             step_id="lock",
             data_schema=vol.Schema(
@@ -527,6 +630,123 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
         )
+
+    async def _async_prepare_current_lock(self) -> ConfigFlowResult:
+        """Import only for a newly selected model verified during this cloud flow."""
+        lock = self._pending[0]
+        if self._cloud_access is None or lock[CONF_DEVICE_ID] not in self._auto_lock_ids:
+            return await self.async_step_lock()
+        return await self._async_import_current_lock()
+
+    async def _async_import_current_lock(self) -> ConfigFlowResult:
+        """Read command logs once without sending any command to the lock."""
+        lock = self._pending[0]
+        access = self._cloud_access
+        device_id = lock[CONF_DEVICE_ID]
+        if access is None or device_id not in self._auto_lock_ids:
+            return await self.async_step_lock()
+        self._import_errors = {}
+        self._import_placeholders = {"lock_name": lock[CONF_NAME]}
+        try:
+            credential = await async_read_unlock_credential(
+                async_get_clientsession(self.hass),
+                access.region,
+                access.client_id,
+                access.client_secret,
+                device_id,
+                since_ms=self._import_since_ms.get(device_id),
+            )
+        except CloudError as error:
+            if self._removed:
+                raise UnknownFlow from None
+            details = _cloud_error_details(error)
+            self._import_errors["base"] = (
+                "cloud_request_failed" if details is not None else "unlock_import_failed"
+            )
+            if details is not None:
+                self._import_placeholders.update(details)
+        else:
+            if self._removed:
+                raise UnknownFlow
+            if credential is not None:
+                self._pending[0] = _credentials(
+                    {
+                        CONF_NAME: lock[CONF_NAME],
+                        CONF_PROFILE: True,
+                        CONF_MEMBER: credential.member,
+                        CONF_REMOTE_CODE: credential.code,
+                    },
+                    lock,
+                )
+                return await self.async_step_lock_ready()
+        # Keep the first prompt's cutoff across retries. A delayed command can
+        # then arrive without allowing an older credential to be reused.
+        self._import_since_ms.setdefault(device_id, time.time_ns() // 1_000_000)
+        return await self.async_step_unlock_import()
+
+    async def async_step_unlock_import(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Retry after the owner opens this lock through the app."""
+        if user_input is not None:
+            return await self._async_import_current_lock()
+        return self.async_show_form(
+            step_id="unlock_import",
+            data_schema=vol.Schema({}),
+            errors=self._import_errors,
+            description_placeholders=self._import_placeholders,
+        )
+
+    async def async_step_lock_ready(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Name and place a verified lock without exposing its technical settings."""
+        lock = self._pending[0]
+        errors = {}
+        if user_input is not None:
+            name = user_input[CONF_NAME].strip()
+            area_id = user_input.get(CONF_AREA_ID)
+            if not name:
+                errors[CONF_NAME] = "invalid_name"
+            if area_id is not None and ar.async_get(self.hass).async_get_area(area_id) is None:
+                errors[CONF_AREA_ID] = "invalid_area"
+            if not errors:
+                if area_id is not None:
+                    self._data.setdefault(CONF_AREAS, {})[lock[CONF_DEVICE_ID]] = area_id
+                return await self._async_finish_current_lock({**lock, CONF_NAME: name})
+        return self.async_show_form(
+            step_id="lock_ready",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_NAME,
+                        default=user_input[CONF_NAME]
+                        if user_input is not None
+                        else lock[CONF_NAME],
+                    ): str,
+                    vol.Optional(CONF_AREA_ID): AreaSelector(),
+                }
+            ),
+            errors=errors,
+            description_placeholders={"lock_name": lock[CONF_NAME]},
+            last_step=len(self._pending) == 1,
+        )
+
+    async def _async_finish_current_lock(self, updated: dict[str, Any]) -> ConfigFlowResult:
+        """Stage exactly one lock, preserving the identities and credentials of siblings."""
+        if self._editing is not None:
+            self._data[CONF_LOCKS] = [
+                updated if item[CONF_DEVICE_ID] == self._editing[CONF_DEVICE_ID] else item
+                for item in self._data[CONF_LOCKS]
+            ]
+            self._editing = None
+        else:
+            self._data[CONF_LOCKS].append(updated)
+            self._pending.pop(0)
+        self._import_since_ms.pop(updated[CONF_DEVICE_ID], None)
+        self._import_errors = {}
+        self._import_placeholders = {}
+        if self._pending:
+            return await self._async_prepare_current_lock()
+        if self._automatic:
+            return await self.async_step_finish()
+        return await self.async_step_manage()
 
     def _lock_selection_schema(self) -> vol.Schema:
         return vol.Schema(
@@ -561,6 +781,7 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
                 for lock in self._data[CONF_LOCKS]
                 if lock[CONF_DEVICE_ID] != user_input[CONF_DEVICE_ID]
             ]
+            self._data.get(CONF_AREAS, {}).pop(user_input[CONF_DEVICE_ID], None)
             return await self.async_step_manage()
         return self.async_show_form(
             step_id="remove_lock", data_schema=self._lock_selection_schema()
@@ -568,6 +789,7 @@ class TuyaBLELockFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_finish(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Commit the validated local configuration."""
+        self._cloud_access = None
         if self._reconfigure:
             return self.async_update_reload_and_abort(
                 self._get_reconfigure_entry(), data=self._data, title=self._data[CONF_NAME]

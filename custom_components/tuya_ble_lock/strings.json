@@ -5,18 +5,19 @@
       "user": {
         "title": "Set up Tuya BLE Lock",
         "menu_options": {
-          "cloud": "Discover locks with Tuya Cloud",
-          "gateway": "Enter local gateway details manually"
+          "cloud": "Automatic setup",
+          "gateway": "Advanced manual setup"
         }
       },
       "cloud": {
-        "title": "Read gateway details from Tuya",
-        "description": "Use a linked Smart Home cloud project. Credentials are used only for this setup session and are not saved. No unlock command is sent. See the README for project setup.",
+        "title": "Connect your gateway",
+        "description": "Enter your linked Tuya project details and the gateway address on your home network. Setup finds supported locks and reads their existing unlock information automatically. Project credentials are used only during setup and are not saved. Setup does not open a lock.",
         "data": {
           "region": "Project data center",
           "client_id": "Access ID / Client ID",
           "client_secret": "Access Secret / Client Secret",
-          "gateway_id": "Gateway device ID"
+          "gateway_id": "Gateway device ID",
+          "host": "Gateway IPv4 address"
         }
       },
       "gateway": {
@@ -32,14 +33,14 @@
       },
       "select_locks": {
         "title": "Select discovered locks",
-        "description": "Select compatible candidates to configure. {unsupported} other children could not be identified as the supported DP61 profile. Check compatibility before adding a lock.",
+        "description": "Select the supported HX201 / T1 locks you want to add. Locks already in Home Assistant are not shown.",
         "data": {
           "locks": "Locks"
         }
       },
       "no_locks": {
         "title": "No new compatible locks found",
-        "description": "No new child could be verified as the supported writable raw DP61 profile. Some device metadata may be unavailable. Check cloud API permissions, gateway pairing and compatibility. You may enter a known supported lock manually.",
+        "description": "No new supported locks were found on this gateway. Check that your HX201 / T1 locks are paired with it in the Tuya app and linked to the cloud project. No settings will be saved.",
         "data": {}
       },
       "manage": {
@@ -90,6 +91,29 @@
         "data": {
           "device_id": "Lock"
         }
+      },
+      "lock_ready": {
+        "title": "Set up {lock_name}",
+        "description": "Choose a name and, optionally, an existing Home Assistant area. The lock settings are ready. Submit the last lock to finish setup; you can then test unlocking from Home Assistant.",
+        "data": {
+          "name": "Lock name",
+          "area_id": "Area"
+        }
+      },
+      "unlock_import": {
+        "title": "Prepare this lock for Home Assistant",
+        "description": "To finish setting up {lock_name}, turn off Bluetooth on your phone, use mobile data, and unlock this lock once in the Tuya app. Confirm that it opens, then submit this form to retry. If an error is shown, resolve it first. Setup does not open the lock.",
+        "data": {}
+      },
+      "gateway_ready": {
+        "title": "Gateway ready",
+        "description": "There are no new supported locks to add. Submit to save the gateway connection details and keep your existing locks unchanged.",
+        "data": {}
+      },
+      "no_locks_manual": {
+        "title": "No new compatible locks found",
+        "description": "No additional supported locks were found. Continue to manage your locks, where you can keep editing or save your changes.",
+        "data": {}
       }
     },
     "error": {
@@ -101,11 +125,18 @@
       "no_locks_selected": "Select at least one available lock.",
       "duplicate_lock": "This lock or child node is already configured.",
       "node_not_found": "The exact node_id was not reported by this gateway. Check pairing and node_id.",
-      "invalid_credentials": "Confirm compatibility and enter eight ASCII digits with a member number from 1 to 65534, or a valid 13-byte DP61 command."
+      "invalid_credentials": "Confirm compatibility and enter eight ASCII digits with a member number from 1 to 65534, or a valid 13-byte DP61 command.",
+      "unlock_import_failed": "Could not read this lock's recent unlock command. Check Tuya project permissions, then retry.",
+      "invalid_name": "Enter a name for this lock.",
+      "invalid_automatic_input": "Check the gateway IPv4 address and exact gateway device ID.",
+      "automatic_gateway_unsupported": "Automatic setup does not recognize this gateway model. Use Advanced manual setup with its known connection settings.",
+      "cannot_connect_automatic": "Cannot reach the gateway at this address. Check that it is powered, connected to Wi-Fi, and reachable from Home Assistant. Close other local clients using the gateway, then retry.",
+      "invalid_area": "Select an existing Home Assistant area, or leave the area empty."
     },
     "abort": {
       "already_configured": "This gateway is already configured. Use Reconfigure to edit it.",
-      "reconfigure_successful": "Gateway and lock settings updated."
+      "reconfigure_successful": "Gateway and lock settings updated.",
+      "no_new_locks": "No new supported locks were found. No settings were saved."
     }
   },
   "options": {

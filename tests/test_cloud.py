@@ -2,14 +2,61 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import traceback
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from aiohttp import ClientError, ClientSession, ContentTypeError
 
 from custom_components.tuya_ble_lock import cloud
+
+_LOG_NOW_MS = 1_700_000_000_000
+
+
+def log_command(member=258, code="00001234", trailer=b"\x00\x01"):
+    """Encode an existing synthetic app command, never a live credential."""
+    return base64.b64encode(b"\x01" + member.to_bytes(2, "big") + code.encode() + trailer).decode()
+
+
+def command_log(**changes):
+    """Represent an outgoing command in the operation-log response."""
+    return {
+        "code": "remote_no_dp_key",
+        "event_id": 5,
+        "event_time": _LOG_NOW_MS - 1000,
+        "event_from": "2",
+        "status": "1",
+        "value": log_command(),
+        **changes,
+    }
+
+
+def log_result(*records, **changes):
+    """Return a complete synthetic log page for exactly one lock."""
+    return {"device_id": "lock-example", "has_next": False, "logs": list(records), **changes}
+
+
+@pytest.fixture
+def unlock_log_time(monkeypatch):
+    """Keep credential freshness checks independent of the real clock."""
+    monkeypatch.setattr(cloud.time, "time_ns", lambda: _LOG_NOW_MS * 1_000_000)
+
+
+async def read_credential(session, **changes):
+    """Read synthetic command logs without cloud requests."""
+    return await cloud.async_read_unlock_credential(
+        **{
+            "session": session,
+            "region": "eu",
+            "client_id": "test-client",
+            "client_secret": "test-secret",
+            "device_id": "lock-example",
+            **changes,
+        }
+    )
 
 
 def response(result=None, *, payload=None, status=200):
@@ -867,3 +914,306 @@ async def test_child_without_any_name_uses_unambiguous_fallback():
     )
     result = await discover(session)
     assert result.locks[0].name == "Tuya device lock-example"
+
+
+@pytest.mark.parametrize("product_id", ["csvxfq3ecmedidkh", "another-gateway-product"])
+async def test_gateway_product_id_is_retained_without_extra_requests_or_protocol_guessing(
+    product_id,
+):
+    """Expose the exact product ID while leaving verified protocol selection to the flow."""
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway(product_id=product_id, version="untrusted-version")),
+        response([]),
+    )
+    result = await discover(session)
+    assert result.product_id == product_id
+    assert not hasattr(result, "version")
+    assert "untrusted-version" not in repr(result)
+    assert session.get.call_count == 3
+
+
+@pytest.mark.parametrize("product_id", [None, 123, {}, "", " csvxfq3ecmedidkh", "../gateway"])
+async def test_invalid_gateway_product_metadata_remains_unknown(product_id):
+    """Never normalize malformed metadata into a supposedly known gateway model."""
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(gateway(product_id=product_id)),
+        response([]),
+    )
+    assert (await discover(session)).product_id is None
+
+
+def test_gateway_discovery_product_id_is_optional_for_existing_callers():
+    assert (
+        cloud.GatewayDiscovery("gateway-example", "Gateway", "0123456789abcdef", []).product_id
+        is None
+    )
+
+
+async def test_unlock_logs_use_one_signed_read_only_iot_core_request(unlock_log_time, caplog):
+    """Read a bounded command-only window and discard all raw response metadata."""
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(log_result(command_log(), current_row_key="private-cursor")),
+    )
+    result = await read_credential(session)
+    assert result == cloud.UnlockCredential(member=258, code="00001234")
+    assert [call.args[0] for call in session.get.call_args_list] == [
+        "https://openapi.tuyaeu.com/v1.0/token?grant_type=1",
+        "https://openapi.tuyaeu.com/v2.0/cloud/thing/lock-example/logs"
+        "?codes=remote_no_dp_key&end_time=1700000000000&query_type=1&size=100"
+        "&start_time=1699998200000&type=5",
+    ]
+    assert session.get.call_args.kwargs["headers"]["access_token"] == "test-token"
+    assert session.get.call_args.kwargs["allow_redirects"] is False
+    session.post.assert_not_called()
+    session.put.assert_not_called()
+    session.delete.assert_not_called()
+    for private in ("00001234", log_command(), "private-cursor", "test-token", "test-secret"):
+        assert private not in repr(result)
+        assert private not in caplog.text
+    assert not hasattr(result, "payload")
+    assert not hasattr(result, "client_secret")
+
+
+@pytest.mark.parametrize(
+    "since_ms,expected_start",
+    [
+        (None, _LOG_NOW_MS - 1_800_000),
+        (0, _LOG_NOW_MS - 1_800_000),
+        (_LOG_NOW_MS - 3_600_000, _LOG_NOW_MS - 1_800_000),
+        (_LOG_NOW_MS - 30_000, _LOG_NOW_MS - 30_000),
+        (_LOG_NOW_MS, _LOG_NOW_MS),
+    ],
+)
+async def test_unlock_log_window_is_bounded_and_retry_cutoff_is_respected(
+    unlock_log_time, since_ms, expected_start
+):
+    session = session_with(response({"access_token": "test-token"}), response(log_result()))
+    assert await read_credential(session, since_ms=since_ms) is None
+    query = parse_qs(urlsplit(session.get.call_args.args[0]).query)
+    assert query["start_time"] == [str(expected_start)]
+    assert query["end_time"] == [str(_LOG_NOW_MS)]
+    assert session.get.call_count == 2
+
+
+@pytest.mark.parametrize("since_ms", [-1, True, "1700000000000", 1.5, _LOG_NOW_MS + 1])
+async def test_invalid_unlock_log_cutoff_never_contacts_cloud(unlock_log_time, since_ms):
+    session = session_with()
+    with pytest.raises(cloud.CloudError) as error:
+        await read_credential(session, since_ms=since_ms)
+    assert error.value.stage == "unlock_logs"
+    assert error.value.reason == "invalid_input"
+    session.get.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"region": "https://example.invalid"},
+        {"region": []},
+        {"device_id": "../other-lock"},
+        {"device_id": "lock?code=private"},
+        {"device_id": None},
+        {"client_id": ""},
+        {"client_secret": "secret\nheader"},
+    ],
+)
+async def test_unlock_log_inputs_are_validated_before_authentication(unlock_log_time, arguments):
+    session = session_with()
+    with pytest.raises(cloud.CloudError) as error:
+        await read_credential(session, **arguments)
+    assert error.value.reason == "invalid_input"
+    session.get.assert_not_called()
+
+
+async def test_unlock_log_newest_command_is_selected_without_assuming_order(unlock_log_time):
+    """A newer report or unrelated DP must not replace a command credential."""
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(
+            log_result(
+                command_log(value=log_command(1, "11111111"), event_time=_LOG_NOW_MS - 3000),
+                command_log(event_time=_LOG_NOW_MS - 1000),
+                command_log(value=log_command(2, "22222222"), event_time=_LOG_NOW_MS - 2000),
+                command_log(event_id=7, value="AAEC", event_time=_LOG_NOW_MS),
+                command_log(code="remote_unlock", value="private-record", event_time=_LOG_NOW_MS),
+            )
+        ),
+    )
+    assert await read_credential(session) == cloud.UnlockCredential(258, "00001234")
+
+
+@pytest.mark.parametrize("event_id", [7, "7", 5.0, True, None, "05"])
+async def test_only_exact_command_events_can_supply_credentials(unlock_log_time, event_id):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(log_result(command_log(event_id=event_id))),
+    )
+    assert await read_credential(session) is None
+
+
+@pytest.mark.parametrize("event_id,status", [(5, "1"), ("5", "1"), (5, 1)])
+async def test_documented_numeric_and_text_event_fields_are_supported(
+    unlock_log_time, event_id, status
+):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(log_result(command_log(event_id=event_id, status=status))),
+    )
+    assert await read_credential(session) == cloud.UnlockCredential(258, "00001234")
+
+
+@pytest.mark.parametrize(
+    "newest_changes",
+    [
+        {"value": "[masked]"},
+        {"value": "AAEC"},
+        {"value": None},
+        {"value": {"private": "00001234"}},
+        {"value": log_command(trailer=b"\x01\x00")},
+        {"value": log_command(member=0)},
+        {"status": "0"},
+        {"status": None},
+        {"status": True},
+        {"status": 1.0},
+        {"event_id": 5.0},
+        {"event_id": None},
+        {"event_id": "05"},
+        {"event_time": str(_LOG_NOW_MS - 1000)},
+        {"event_time": float(_LOG_NOW_MS - 1000)},
+        {"event_time": True},
+        {"event_time": None},
+        {"event_time": -1},
+    ],
+)
+async def test_newest_invalid_command_never_falls_back_to_older_credential(
+    unlock_log_time, newest_changes, caplog
+):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(
+            log_result(
+                command_log(event_time=_LOG_NOW_MS - 10_000),
+                command_log(**{"event_time": _LOG_NOW_MS - 1000, **newest_changes}),
+            )
+        ),
+    )
+    assert await read_credential(session) is None
+    assert "00001234" not in caplog.text
+
+
+async def test_unlock_credentials_remain_independent_for_each_selected_device(unlock_log_time):
+    """Never reuse one lock's command or the previous result for another lock."""
+    first_session = session_with(
+        response({"access_token": "first-token"}),
+        response(log_result(command_log(device_id="lock-example"))),
+    )
+    second_session = session_with(
+        response({"access_token": "second-token"}),
+        response(
+            log_result(
+                command_log(device_id="second-lock", value=log_command(17, "12345678")),
+                device_id="second-lock",
+            )
+        ),
+    )
+    assert await read_credential(first_session) == cloud.UnlockCredential(258, "00001234")
+    assert await read_credential(second_session, device_id="second-lock") == cloud.UnlockCredential(
+        17, "12345678"
+    )
+    assert "/second-lock/logs?" in second_session.get.call_args.args[0]
+    assert second_session.get.call_args.kwargs["headers"]["access_token"] == "second-token"
+
+
+@pytest.mark.parametrize("code,member", [("87654321", 258), ("00001234", 259)])
+async def test_same_time_conflicting_credentials_are_not_guessed(unlock_log_time, code, member):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(log_result(command_log(), command_log(value=log_command(member, code)))),
+    )
+    assert await read_credential(session) is None
+
+
+async def test_duplicate_credentials_and_both_source_trailers_are_unambiguous(unlock_log_time):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(
+            log_result(
+                command_log(),
+                command_log(value=log_command(trailer=b"\x00\x00")),
+                command_log(value="[masked]", event_time=_LOG_NOW_MS - 10_000),
+            )
+        ),
+    )
+    assert await read_credential(session) == cloud.UnlockCredential(258, "00001234")
+
+
+@pytest.mark.parametrize("event_time", [_LOG_NOW_MS - 1_800_001, _LOG_NOW_MS + 1])
+async def test_commands_outside_requested_window_are_not_imported(unlock_log_time, event_time):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(log_result(command_log(event_time=event_time))),
+    )
+    assert await read_credential(session) is None
+
+
+async def test_retry_does_not_reuse_command_before_its_cutoff(unlock_log_time):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(log_result(command_log(event_time=_LOG_NOW_MS - 1000))),
+    )
+    assert await read_credential(session, since_ms=_LOG_NOW_MS - 500) is None
+
+
+@pytest.mark.parametrize(
+    "result,reason",
+    [
+        (None, "invalid_response"),
+        ([], "invalid_response"),
+        (log_result(command_log(), device_id="other-lock"), "invalid_response"),
+        (log_result(command_log(), device_id=None), "invalid_response"),
+        (log_result(command_log(device_id="other-lock")), "invalid_response"),
+        (log_result(command_log(device_id=None)), "invalid_response"),
+        (log_result(logs={}), "invalid_response"),
+        (log_result(logs=None), "invalid_response"),
+        (log_result(has_next=None), "invalid_response"),
+        (log_result(has_next=0), "invalid_response"),
+        (log_result(has_next="false"), "invalid_response"),
+        (log_result(command_log(), has_next=True), "incomplete_logs"),
+        (log_result(*[command_log()] * 101), "invalid_response"),
+        (log_result(command_log(), "private-record"), "invalid_response"),
+    ],
+)
+async def test_invalid_or_truncated_log_page_never_supplies_credentials(
+    unlock_log_time, result, reason
+):
+    session = session_with(response({"access_token": "test-token"}), response(result))
+    with pytest.raises(cloud.CloudError) as error:
+        await read_credential(session)
+    assert error.value.stage == "unlock_logs"
+    assert error.value.reason == reason
+    assert session.get.call_count == 2
+    for private in ("00001234", log_command(), "private-record", "other-lock"):
+        assert private not in str(error.value)
+        assert private not in repr(error.value)
+
+
+@pytest.mark.parametrize(
+    "code,error_class", [("1106", cloud.CloudAuthError), ("28841002", cloud.CloudError)]
+)
+async def test_unlock_log_api_failures_preserve_only_safe_diagnostics(
+    unlock_log_time, code, error_class, caplog
+):
+    session = session_with(
+        response({"access_token": "test-token"}),
+        response(payload={"success": False, "code": code, "msg": "private-code-00001234"}),
+    )
+    with pytest.raises(error_class) as error:
+        await read_credential(session)
+    assert error.value.stage == "unlock_logs"
+    assert error.value.reason == "api_error"
+    assert error.value.code == code
+    assert "00001234" not in str(error.value)
+    assert "00001234" not in caplog.text

@@ -9,8 +9,11 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlencode
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, ContentTypeError
+
+from .credentials import UnlockCredential, decode_unlock_command
 
 REGION_ENDPOINTS = {
     "cn": "https://openapi.tuyacn.com",
@@ -98,6 +101,7 @@ _ERROR_STAGES = {
     "gateway_children",
     "child_details",
     "child_specification",
+    "unlock_logs",
 }
 _ERROR_REASONS = {
     "unknown",
@@ -115,10 +119,13 @@ _ERROR_REASONS = {
     "invalid_children",
     "conflicting_children",
     "invalid_child",
+    "incomplete_logs",
 }
 _DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _NODE_ID = re.compile(r"[A-Za-z0-9:_-]{1,128}\Z")
 _EMPTY_BODY_HASH = hashlib.sha256(b"").hexdigest()
+_UNLOCK_LOG_WINDOW_MS = 30 * 60 * 1000
+_UNLOCK_LOG_PAGE_SIZE = 100
 
 
 class CloudError(Exception):
@@ -168,6 +175,7 @@ class GatewayDiscovery:
     name: str
     local_key: str
     locks: list[DiscoveredLock]
+    product_id: str | None = None
 
 
 class _DiscoveryClient:
@@ -307,7 +315,7 @@ def _text(value: Any, fallback: str) -> str:
 
 
 def _product_id(value: Any) -> str | None:
-    """Keep only a valid product identifier for selecting a known state profile."""
+    """Keep only a valid product identifier for selecting a verified device profile."""
     return value if isinstance(value, str) and _DEVICE_ID.fullmatch(value) else None
 
 
@@ -511,4 +519,124 @@ async def async_discover_gateway(
         name=_text(gateway.get("name"), "Tuya BLE gateway"),
         local_key=local_key,
         locks=locks,
+        product_id=_product_id(gateway.get("product_id")),
     )
+
+
+async def async_read_unlock_credential(
+    session: ClientSession,
+    region: str,
+    client_id: str,
+    client_secret: str,
+    device_id: str,
+    *,
+    since_ms: int | None = None,
+) -> UnlockCredential | None:
+    """Read the newest recent DP61 command without sending or testing a command.
+
+    Callers must first verify that the lock uses the supported product profile.
+    A log records command issuance, not successful execution. Only a complete
+    bounded page is used, because Tuya does not guarantee its ordering. No raw
+    command, log metadata, API credential, or token is returned to the caller.
+    """
+    if (
+        not isinstance(region, str)
+        or region not in REGION_ENDPOINTS
+        or not isinstance(device_id, str)
+        or not _DEVICE_ID.fullmatch(device_id)
+    ):
+        raise CloudError(
+            "Enter valid Tuya device details", stage="unlock_logs", reason="invalid_input"
+        )
+    end_ms = time.time_ns() // 1_000_000
+    if since_ms is not None and (type(since_ms) is not int or not 0 <= since_ms <= end_ms):
+        raise CloudError(
+            "Enter a valid log search time", stage="unlock_logs", reason="invalid_input"
+        )
+    if not all(
+        isinstance(value, str)
+        and value
+        and value.isascii()
+        and all(32 < ord(character) < 127 for character in value)
+        for value in (client_id, client_secret)
+    ):
+        raise CloudAuthError(
+            "Enter valid Tuya project credentials", stage="token", reason="invalid_input"
+        )
+    start_ms = max(end_ms - _UNLOCK_LOG_WINDOW_MS, since_ms or 0)
+    query = urlencode(
+        sorted(
+            {
+                "codes": "remote_no_dp_key",
+                "end_time": end_ms,
+                "query_type": 1,
+                "size": _UNLOCK_LOG_PAGE_SIZE,
+                "start_time": start_ms,
+                "type": 5,
+            }.items()
+        )
+    )
+    client = _DiscoveryClient(session, REGION_ENDPOINTS[region], client_id, client_secret)
+    await client.authenticate()
+    result = await client.get(f"/v2.0/cloud/thing/{device_id}/logs?{query}", stage="unlock_logs")
+    if (
+        not isinstance(result, dict)
+        or result.get("device_id") != device_id
+        or not isinstance(result.get("logs"), list)
+        or len(result["logs"]) > _UNLOCK_LOG_PAGE_SIZE
+        or type(result.get("has_next")) is not bool
+    ):
+        raise CloudError(
+            "Tuya did not return valid device logs", stage="unlock_logs", reason="invalid_response"
+        )
+    if result["has_next"]:
+        raise CloudError(
+            "The log search returned an incomplete page",
+            stage="unlock_logs",
+            reason="incomplete_logs",
+        )
+
+    newest_time = -1
+    newest: list[dict[str, Any]] = []
+    for record in result["logs"]:
+        if not isinstance(record, dict):
+            raise CloudError(
+                "Tuya returned an invalid log entry", stage="unlock_logs", reason="invalid_response"
+            )
+        if "device_id" in record and record["device_id"] != device_id:
+            raise CloudError(
+                "Tuya returned a log for another device",
+                stage="unlock_logs",
+                reason="invalid_response",
+            )
+        if record.get("code") != "remote_no_dp_key":
+            continue
+        event_id = record.get("event_id")
+        if type(event_id) in (int, str) and event_id in (7, "7"):
+            continue
+        if type(event_id) not in (int, str) or event_id not in (5, "5"):
+            return None
+        event_time = record.get("event_time")
+        if type(event_time) is not int or event_time <= 0:
+            return None
+        if not start_ms <= event_time <= end_ms:
+            continue
+        if event_time > newest_time:
+            newest_time = event_time
+            newest = [record]
+        elif event_time == newest_time:
+            newest.append(record)
+
+    credential = None
+    for record in newest:
+        status = record.get("status")
+        if type(status) not in (int, str) or status not in (1, "1"):
+            return None
+        try:
+            candidate = decode_unlock_command(record.get("value"))
+        except ValueError:
+            return None
+        if credential is not None and credential != candidate:
+            return None
+        credential = candidate
+    return credential

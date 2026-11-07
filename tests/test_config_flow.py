@@ -1,13 +1,22 @@
 """Exercise the real Home Assistant flows without contacting any devices."""
 
+import asyncio
 import base64
 from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant import config_entries
-from homeassistant.const import CONF_DEVICE_ID, CONF_HOST, CONF_NAME, CONF_SCAN_INTERVAL
-from homeassistant.data_entry_flow import FlowResultType, InvalidData
+from homeassistant.const import (
+    ATTR_AREA_ID as CONF_AREA_ID,
+)
+from homeassistant.const import (
+    CONF_DEVICE_ID,
+    CONF_HOST,
+    CONF_NAME,
+    CONF_SCAN_INTERVAL,
+)
+from homeassistant.data_entry_flow import FlowResultType, InvalidData, UnknownFlow
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 import custom_components.tuya_ble_lock as integration
@@ -19,6 +28,7 @@ from custom_components.tuya_ble_lock.cloud import (
     GatewayDiscovery,
 )
 from custom_components.tuya_ble_lock.const import (
+    CONF_AREAS,
     CONF_GATEWAY_ID,
     CONF_LOCAL_KEY,
     CONF_LOCKS,
@@ -34,6 +44,7 @@ from custom_components.tuya_ble_lock.const import (
     STATE_SOURCE_HX201_DP40,
     STATE_SOURCE_MOTOR_DP47,
 )
+from custom_components.tuya_ble_lock.credentials import UnlockCredential
 from custom_components.tuya_ble_lock.local import LocalError, Topology
 
 pytestmark = pytest.mark.asyncio
@@ -57,8 +68,23 @@ CLOUD = {
     "region": "eu",
     "client_id": "test-client",
     "client_secret": "test-secret",
+    CONF_HOST: GATEWAY[CONF_HOST],
     CONF_GATEWAY_ID: "gateway-example",
 }
+
+
+def discovered_gateway(*args, **kwargs):
+    """Build synthetic metadata for the verified automatic gateway profile."""
+    kwargs.setdefault("product_id", "csvxfq3ecmedidkh")
+    return GatewayDiscovery(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def credential_reader(monkeypatch):
+    """Keep all command-history requests offline, including existing setup tests."""
+    reader = AsyncMock(return_value=None)
+    monkeypatch.setattr(config_flow, "async_read_unlock_credential", reader)
+    return reader
 
 
 @pytest.fixture(autouse=True)
@@ -170,53 +196,49 @@ async def test_manual_lock_persists_explicit_state_source(hass, state_source):
 
 
 @pytest.mark.parametrize(
-    "product_id,expected_source",
-    [
-        (HX201_PRODUCT_ID, STATE_SOURCE_HX201_DP40),
-        (None, STATE_SOURCE_MOTOR_DP47),
-        ("unknown-product", STATE_SOURCE_MOTOR_DP47),
-        (HX201_PRODUCT_ID.upper(), STATE_SOURCE_MOTOR_DP47),
-    ],
+    "product_id", [HX201_PRODUCT_ID, None, "unknown-product", HX201_PRODUCT_ID.upper()]
 )
 async def test_cloud_state_source_default_requires_exact_verified_product_id(
-    hass, monkeypatch, product_id, expected_source
+    hass, monkeypatch, credential_reader, product_id
 ):
-    """Only the known PID selects DP40; a matching marketing name is insufficient."""
-    discovery = GatewayDiscovery(
-        GATEWAY[CONF_GATEWAY_ID],
-        GATEWAY[CONF_NAME],
-        GATEWAY[CONF_LOCAL_KEY],
-        [
-            DiscoveredLock(
-                LOCK[CONF_DEVICE_ID],
-                LOCK[CONF_NODE_ID],
-                LOCK[CONF_NAME],
-                "HX201_BLE_LOCKER",
-                True,
-                product_id=product_id,
-            )
-        ],
+    """Only exact verified product metadata enters automatic setup."""
+    credential_reader.return_value = UnlockCredential(2, "00001234")
+    lock = DiscoveredLock(
+        LOCK[CONF_DEVICE_ID],
+        LOCK[CONF_NODE_ID],
+        LOCK[CONF_NAME],
+        "HX201_BLE_LOCKER",
+        True,
+        product_id=product_id,
     )
-    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(return_value=discovery))
+    monkeypatch.setattr(
+        config_flow,
+        "async_discover_gateway",
+        AsyncMock(
+            return_value=discovered_gateway(
+                GATEWAY[CONF_GATEWAY_ID], GATEWAY[CONF_NAME], GATEWAY[CONF_LOCAL_KEY], [lock]
+            )
+        ),
+    )
     result = await start(hass, "cloud")
     result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {key: GATEWAY[key] for key in (CONF_NAME, CONF_HOST, CONF_VERSION)},
-    )
+    if product_id != HX201_PRODUCT_ID:
+        assert result["step_id"] == "no_locks"
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+        assert result["type"] is FlowResultType.ABORT and result["reason"] == "no_new_locks"
+        credential_reader.assert_not_awaited()
+        return
+    assert result["step_id"] == "select_locks"
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_LOCKS: [LOCK[CONF_DEVICE_ID]]}
     )
-    form_values = {CONF_NAME: LOCK[CONF_NAME], CONF_PROFILE: True, CONF_MEMBER: 1}
-    assert result["data_schema"](form_values)[CONF_STATE_SOURCE] == expected_source
-    result = await hass.config_entries.flow.async_configure(result["flow_id"], form_values)
+    assert result["step_id"] == "lock_ready"
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"next_step_id": "finish"}
+        result["flow_id"], {CONF_NAME: LOCK[CONF_NAME]}
     )
     stored = result["data"][CONF_LOCKS][0]
-    assert stored[CONF_STATE_SOURCE] == expected_source
+    assert stored[CONF_STATE_SOURCE] == STATE_SOURCE_HX201_DP40
     assert set(stored) == set(LOCK)
-    assert "product_id" not in stored and "product_name" not in stored
     await hass.async_block_till_done()
 
 
@@ -269,20 +291,23 @@ async def test_edit_preserves_state_source_and_defaults_legacy_entries_to_motor(
     assert config_entry.data[CONF_LOCKS][0][CONF_REMOTE_CODE] == LOCK[CONF_REMOTE_CODE]
 
 
-async def test_cloud_rediscovery_does_not_replace_a_saved_state_source(hass, monkeypatch):
-    """Finding the known HX201 PID again does not override a previous user selection."""
+async def test_cloud_rediscovery_does_not_replace_a_saved_state_source(
+    hass, monkeypatch, credential_reader
+):
+    """An empty rediscovery can refresh the key while preserving every existing lock setting."""
     config_entry = entry(hass)
     monkeypatch.setattr(hass.config_entries, "async_reload", AsyncMock(return_value=True))
-    discovery = GatewayDiscovery(
+    fresh_key = "abcdef0123456789"
+    discovery = discovered_gateway(
         GATEWAY[CONF_GATEWAY_ID],
-        GATEWAY[CONF_NAME],
-        GATEWAY[CONF_LOCAL_KEY],
+        "Cloud name",
+        fresh_key,
         [
             DiscoveredLock(
                 LOCK[CONF_DEVICE_ID],
                 LOCK[CONF_NODE_ID],
                 LOCK[CONF_NAME],
-                "HX201_BLE_LOCKER",
+                "HX201",
                 True,
                 product_id=HX201_PRODUCT_ID,
             )
@@ -296,17 +321,23 @@ async def test_cloud_rediscovery_does_not_replace_a_saved_state_source(hass, mon
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {"next_step_id": "cloud"}
     )
+    assert (
+        result["data_schema"]({"client_id": "test-client", "client_secret": "test-secret"})[
+            CONF_HOST
+        ]
+        == GATEWAY[CONF_HOST]
+    )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {key: value for key, value in CLOUD.items() if key != CONF_GATEWAY_ID}
     )
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {key: GATEWAY[key] for key in (CONF_NAME, CONF_HOST, CONF_VERSION)},
-    )
-    assert result["step_id"] == "no_locks"
+    assert result["step_id"] == "gateway_ready" and result["last_step"] is True
+    assert config_entry.data[CONF_LOCAL_KEY] == GATEWAY[CONF_LOCAL_KEY]
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
-    await hass.config_entries.flow.async_configure(result["flow_id"], {"next_step_id": "finish"})
+    assert result["reason"] == "reconfigure_successful"
     assert config_entry.data[CONF_LOCKS] == [LOCK]
+    assert config_entry.data[CONF_LOCAL_KEY] == fresh_key
+    assert config_entry.data[CONF_NAME] == GATEWAY[CONF_NAME]
+    credential_reader.assert_not_awaited()
 
 
 @pytest.mark.parametrize("remote_code,confirmed", [("too-short", True), ("12345678", False)])
@@ -326,50 +357,53 @@ async def test_bad_credentials_or_unconfirmed_profile_cannot_be_saved(hass, remo
     assert hass.config_entries.async_entries(DOMAIN) == []
 
 
-async def test_cloud_discovery_keeps_credentials_out_of_config_entry(hass, monkeypatch):
-    discovery = GatewayDiscovery(
-        gateway_id=GATEWAY[CONF_GATEWAY_ID],
-        name=GATEWAY[CONF_NAME],
-        local_key=GATEWAY[CONF_LOCAL_KEY],
-        locks=[
+async def test_cloud_discovery_keeps_credentials_out_of_config_entry(
+    hass, monkeypatch, credential_reader, flow_mocks
+):
+    """Automatic setup never displays or saves technical cloud fields."""
+    credential_reader.return_value = UnlockCredential(1, "12345678")
+    discovery = discovered_gateway(
+        GATEWAY[CONF_GATEWAY_ID],
+        GATEWAY[CONF_NAME],
+        GATEWAY[CONF_LOCAL_KEY],
+        [
             DiscoveredLock(
-                LOCK[CONF_DEVICE_ID], LOCK[CONF_NODE_ID], LOCK[CONF_NAME], "Example", True
+                LOCK[CONF_DEVICE_ID],
+                LOCK[CONF_NODE_ID],
+                LOCK[CONF_NAME],
+                "HX201",
+                True,
+                product_id=HX201_PRODUCT_ID,
             ),
-            DiscoveredLock("bulb-example", "secondnode", "Example bulb", "Example", False),
+            DiscoveredLock("bulb-example", "secondnode", "Bulb", "Example", False),
         ],
     )
     discover_gateway = AsyncMock(return_value=discovery)
     monkeypatch.setattr(config_flow, "async_discover_gateway", discover_gateway)
     result = await start(hass, "cloud")
+    assert {str(key.schema) for key in result["data_schema"].schema} == {
+        "region",
+        "client_id",
+        "client_secret",
+        CONF_GATEWAY_ID,
+        CONF_HOST,
+    }
     result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
-    assert result["step_id"] == "gateway"
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {
-            key: value
-            for key, value in GATEWAY.items()
-            if key not in (CONF_LOCAL_KEY, CONF_GATEWAY_ID)
-        },
-    )
     assert result["step_id"] == "select_locks"
-    assert result["description_placeholders"]["unsupported"] == "1"
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_LOCKS: [LOCK[CONF_DEVICE_ID]]}
     )
+    assert result["step_id"] == "lock_ready"
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {CONF_NAME: LOCK[CONF_NAME], CONF_PROFILE: True, CONF_MEMBER: 1},
-    )
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"next_step_id": "finish"}
+        result["flow_id"], {CONF_NAME: LOCK[CONF_NAME]}
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert set(result["data"]) == set(GATEWAY) | {CONF_LOCKS}
-    assert "test-secret" not in repr(result["data"])
-    assert "test-client" not in repr(result["data"])
-    assert "region" not in result["data"]
+    assert "test-secret" not in repr(result["data"]) and "test-client" not in repr(result["data"])
     assert result["data"][CONF_LOCAL_KEY] == GATEWAY[CONF_LOCAL_KEY]
     discover_gateway.assert_awaited_once()
+    flow_mocks.probe.assert_called_once()
+    flow_mocks.unlock.assert_not_called()
     await hass.async_block_till_done()
 
 
@@ -526,42 +560,31 @@ async def test_cloud_error_reference_never_formats_unknown_codes_or_malformed_st
 async def test_cloud_retry_keeps_only_selected_region_and_does_not_prefill_credentials(
     hass, monkeypatch
 ):
-    discovery = GatewayDiscovery(
+    discovery = discovered_gateway(
         GATEWAY[CONF_GATEWAY_ID], GATEWAY[CONF_NAME], GATEWAY[CONF_LOCAL_KEY], []
     )
     discover_gateway = AsyncMock(
-        side_effect=[
-            CloudError(stage="token", reason="connection"),
-            discovery,
-        ]
+        side_effect=[CloudError(stage="token", reason="connection"), discovery]
     )
     monkeypatch.setattr(config_flow, "async_discover_gateway", discover_gateway)
     result = await start(hass, "cloud")
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {**CLOUD, "region": "sg"}
     )
-    retry = {key: value for key, value in CLOUD.items() if key != "region"}
+    retry = {key: value for key, value in CLOUD.items() if key not in ("region", CONF_HOST)}
     validated = result["data_schema"](retry)
-    assert validated["region"] == "sg"
+    assert validated["region"] == "sg" and validated[CONF_HOST] == GATEWAY[CONF_HOST]
     for marker in result["data_schema"].schema:
         if str(marker.schema) in ("client_id", "client_secret"):
             assert marker.default is config_flow.vol.UNDEFINED
             assert not marker.description
     assert "test-secret" not in repr(result) and "test-client" not in repr(result)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], retry)
-    assert result["step_id"] == "gateway"
+    assert result["step_id"] == "no_locks"
     assert [call.args[1] for call in discover_gateway.await_args_list] == ["sg", "sg"]
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {key: GATEWAY[key] for key in (CONF_NAME, CONF_HOST, CONF_VERSION)}
-    )
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"next_step_id": "finish"}
-    )
-    assert set(result["data"]) == set(GATEWAY) | {CONF_LOCKS}
-    assert "region" not in result["data"]
-    assert "test-secret" not in repr(result["data"])
-    assert "test-client" not in repr(result["data"])
-    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["type"] is FlowResultType.ABORT
+    assert hass.config_entries.async_entries(DOMAIN) == []
 
 
 async def test_failed_local_connection_does_not_create_entry(hass, flow_mocks):
@@ -767,35 +790,24 @@ async def test_options_updates_polling_without_changing_credentials(hass, monkey
     assert config_entry.data == original
 
 
-async def test_stale_cloud_node_is_not_offered_and_gateway_only_setup_is_possible(
-    hass, monkeypatch
-):
-    discovery = GatewayDiscovery(
+async def test_stale_cloud_node_is_not_offered_or_saved(hass, monkeypatch):
+    discovery = discovered_gateway(
         GATEWAY[CONF_GATEWAY_ID],
         GATEWAY[CONF_NAME],
         GATEWAY[CONF_LOCAL_KEY],
-        [DiscoveredLock("stale-lock", "stalenode", "Stale lock", "Example", True)],
+        [
+            DiscoveredLock(
+                "stale-lock", "stalenode", "Stale lock", "HX201", True, product_id=HX201_PRODUCT_ID
+            )
+        ],
     )
     monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(return_value=discovery))
     result = await start(hass, "cloud")
     result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {
-            key: value
-            for key, value in GATEWAY.items()
-            if key not in (CONF_LOCAL_KEY, CONF_GATEWAY_ID)
-        },
-    )
     assert result["step_id"] == "no_locks"
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
-    assert result["step_id"] == "manage"
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"next_step_id": "finish"}
-    )
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["data"][CONF_LOCKS] == []
-    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.ABORT and result["reason"] == "no_new_locks"
+    assert hass.config_entries.async_entries(DOMAIN) == []
 
 
 async def test_duplicate_lock_cannot_be_added_under_another_gateway(hass):
@@ -912,8 +924,11 @@ async def test_options_rejects_out_of_range_polling(hass, interval):
     assert config_entry.options == {}
 
 
-async def test_imported_payload_preserves_leading_zero_code_and_extracts_member(hass, flow_mocks):
-    raw_payload = b"\x01\x01\x23" + b"00001234" + b"\x00\x00"
+@pytest.mark.parametrize("trailer", [b"\x00\x00", b"\x00\x01"])
+async def test_imported_payload_preserves_leading_zero_code_and_extracts_member(
+    hass, flow_mocks, trailer
+):
+    raw_payload = b"\x01\x01\x23" + b"00001234" + trailer
     payload = base64.b64encode(raw_payload).decode("ascii")
     result = await manual_to_credentials(hass)
     result = await hass.config_entries.flow.async_configure(
@@ -940,7 +955,7 @@ async def test_imported_payload_preserves_leading_zero_code_and_extracts_member(
         "\N{SNOWMAN}",
         base64.b64encode(b"short").decode(),
         base64.b64encode(b"\x00\x00\x01" + b"12345678" + b"\x00\x00").decode(),
-        base64.b64encode(b"\x01\x00\x01" + b"12345678" + b"\x00\x01").decode(),
+        base64.b64encode(b"\x01\x00\x01" + b"12345678" + b"\x00\x02").decode(),
         base64.b64encode(b"\x01\x00\x00" + b"12345678" + b"\x00\x00").decode(),
         base64.b64encode(b"\x01\xff\xff" + b"12345678" + b"\x00\x00").decode(),
         base64.b64encode(b"\x01\x00\x01" + b"\xff" * 8 + b"\x00\x00").decode(),
@@ -973,67 +988,50 @@ async def test_invalid_imported_payload_is_rejected_without_device_writes(
 
 
 async def test_multiple_cloud_locks_keep_independent_node_member_and_code(
-    hass, monkeypatch, flow_mocks
+    hass, monkeypatch, flow_mocks, credential_reader
 ):
-    discovery = GatewayDiscovery(
-        GATEWAY[CONF_GATEWAY_ID],
-        GATEWAY[CONF_NAME],
-        GATEWAY[CONF_LOCAL_KEY],
-        [
-            DiscoveredLock(
-                LOCK[CONF_DEVICE_ID], LOCK[CONF_NODE_ID], LOCK[CONF_NAME], "Example", True
-            ),
-            DiscoveredLock("second-lock", "secondnode", "Second lock", "Example", True),
-        ],
-    )
-    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(return_value=discovery))
-    result = await start(hass, "cloud")
-    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    credential_reader.side_effect = [
+        UnlockCredential(2, "12345678"),
+        UnlockCredential(3, "87654321"),
+    ]
+    locks = [
+        DiscoveredLock(
+            LOCK[CONF_DEVICE_ID],
+            LOCK[CONF_NODE_ID],
+            LOCK[CONF_NAME],
+            "HX201",
+            True,
+            product_id=HX201_PRODUCT_ID,
+        ),
+        DiscoveredLock(
+            "second-lock", "secondnode", "Second lock", "HX201", True, product_id=HX201_PRODUCT_ID
+        ),
+    ]
+    result = await cloud_to_selected_locks(hass, monkeypatch, locks)
+    assert result["step_id"] == "lock_ready" and result["last_step"] is False
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {
-            key: value
-            for key, value in GATEWAY.items()
-            if key not in (CONF_LOCAL_KEY, CONF_GATEWAY_ID)
-        },
+        result["flow_id"], {CONF_NAME: "First configured lock"}
     )
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_LOCKS: [LOCK[CONF_DEVICE_ID], "second-lock"]}
-    )
-    assert result["step_id"] == "lock"
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {
-            CONF_NAME: "First configured lock",
-            CONF_PROFILE: True,
-            CONF_MEMBER: 2,
-            CONF_REMOTE_CODE: "12345678",
-        },
-    )
-    assert result["step_id"] == "lock"
+    assert result["step_id"] == "lock_ready" and result["last_step"] is True
     assert hass.config_entries.async_entries(DOMAIN) == []
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {
-            CONF_NAME: "Second configured lock",
-            CONF_PROFILE: True,
-            CONF_MEMBER: 3,
-            CONF_REMOTE_CODE: "87654321",
-        },
+        result["flow_id"], {CONF_NAME: "Second configured lock"}
     )
-    assert result["step_id"] == "manage"
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"next_step_id": "finish"}
-    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_LOCKS] == [
-        {**LOCK, CONF_NAME: "First configured lock", CONF_MEMBER: 2},
+        {
+            **LOCK,
+            CONF_NAME: "First configured lock",
+            CONF_MEMBER: 2,
+            CONF_STATE_SOURCE: STATE_SOURCE_HX201_DP40,
+        },
         {
             CONF_DEVICE_ID: "second-lock",
             CONF_NODE_ID: "secondnode",
             CONF_NAME: "Second configured lock",
             CONF_MEMBER: 3,
             CONF_REMOTE_CODE: "87654321",
-            CONF_STATE_SOURCE: STATE_SOURCE_MOTOR_DP47,
+            CONF_STATE_SOURCE: STATE_SOURCE_HX201_DP40,
         },
     ]
     flow_mocks.unlock.assert_not_called()
@@ -1042,7 +1040,7 @@ async def test_multiple_cloud_locks_keep_independent_node_member_and_code(
 
 async def test_further_discovery_cannot_change_gateway_after_adding_lock(hass, monkeypatch):
     discover_gateway = AsyncMock(
-        return_value=GatewayDiscovery(
+        return_value=discovered_gateway(
             GATEWAY[CONF_GATEWAY_ID], GATEWAY[CONF_NAME], GATEWAY[CONF_LOCAL_KEY], []
         )
     )
@@ -1069,21 +1067,8 @@ async def test_further_discovery_cannot_change_gateway_after_adding_lock(hass, m
         result["flow_id"], {key: value for key, value in CLOUD.items() if key != CONF_GATEWAY_ID}
     )
     assert discover_gateway.await_args.args[-1] == GATEWAY[CONF_GATEWAY_ID]
-    with pytest.raises(InvalidData):
-        await hass.config_entries.flow.async_configure(
-            result["flow_id"], {**GATEWAY, CONF_GATEWAY_ID: "different-gateway"}
-        )
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {
-            key: value
-            for key, value in GATEWAY.items()
-            if key not in (CONF_LOCAL_KEY, CONF_GATEWAY_ID)
-        },
-    )
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"next_step_id": "finish"}
-    )
+    assert result["step_id"] == "gateway_ready"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["data"][CONF_GATEWAY_ID] == GATEWAY[CONF_GATEWAY_ID]
     assert result["data"][CONF_LOCKS] == [LOCK]
     await hass.async_block_till_done()
@@ -1109,3 +1094,546 @@ async def test_malformed_gateway_settings_never_probe_network(hass, flow_mocks, 
     assert result["step_id"] == "gateway"
     assert result["errors"] == {"base": "invalid_input"}
     flow_mocks.probe.assert_not_called()
+
+
+async def cloud_to_selected_locks(hass, monkeypatch, locks=None):
+    """Select synthetic verified models without contacting Tuya or the gateway."""
+    if locks is None:
+        locks = [
+            DiscoveredLock(
+                LOCK[CONF_DEVICE_ID],
+                LOCK[CONF_NODE_ID],
+                LOCK[CONF_NAME],
+                "HX201",
+                True,
+                product_id=HX201_PRODUCT_ID,
+            )
+        ]
+    monkeypatch.setattr(
+        config_flow,
+        "async_discover_gateway",
+        AsyncMock(
+            return_value=discovered_gateway(
+                GATEWAY[CONF_GATEWAY_ID],
+                GATEWAY[CONF_NAME],
+                GATEWAY[CONF_LOCAL_KEY],
+                locks,
+            )
+        ),
+    )
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_LOCKS: [lock.device_id for lock in locks]},
+    )
+
+
+async def test_verified_model_imports_minimal_credential_and_clears_cloud_access(
+    hass,
+    monkeypatch,
+    credential_reader,
+    flow_mocks,
+):
+    """Automatic import needs only a name and persists no project or raw-log data."""
+    credential_reader.return_value = UnlockCredential(member=291, code="00001234")
+    result = await cloud_to_selected_locks(hass, monkeypatch)
+    assert result["step_id"] == "lock_ready"
+    assert {str(marker.schema) for marker in result["data_schema"].schema} == {
+        CONF_NAME,
+        CONF_AREA_ID,
+    }
+    assert result["description_placeholders"] == {"lock_name": LOCK[CONF_NAME]}
+    for secret in ("00001234", CLOUD["client_id"], CLOUD["client_secret"]):
+        assert secret not in repr(result)
+    credential_reader.assert_awaited_once()
+    assert credential_reader.await_args.args[1:] == (
+        CLOUD["region"],
+        CLOUD["client_id"],
+        CLOUD["client_secret"],
+        LOCK[CONF_DEVICE_ID],
+    )
+    assert credential_reader.await_args.kwargs == {"since_ms": None}
+    flow = hass.config_entries.flow._progress[result["flow_id"]]
+    assert flow._data[CONF_LOCKS] == []
+    assert CLOUD["client_secret"] not in repr(flow._cloud_access)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {CONF_NAME: " "})
+    assert result["errors"] == {CONF_NAME: "invalid_name"}
+    credential_reader.assert_awaited_once()
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_NAME: "Renamed cabinet"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        **GATEWAY,
+        CONF_LOCKS: [
+            {
+                **LOCK,
+                CONF_NAME: "Renamed cabinet",
+                CONF_MEMBER: 291,
+                CONF_REMOTE_CODE: "00001234",
+                CONF_STATE_SOURCE: STATE_SOURCE_HX201_DP40,
+            }
+        ],
+    }
+    assert flow._cloud_access is None
+    assert not flow._auto_lock_ids and not flow._pending
+    for key in ("client_id", "client_secret", "region", CONF_PAYLOAD, "product_id"):
+        assert key not in repr(result["data"])
+    flow_mocks.unlock.assert_not_called()
+    await hass.async_block_till_done()
+
+
+async def test_import_retry_uses_per_lock_cutoff_and_keeps_sibling_credentials_separate(
+    hass,
+    monkeypatch,
+    credential_reader,
+    flow_mocks,
+):
+    """Retries use the first prompt's cutoff; the next lock starts a new history window."""
+    now_ms = 1_800_000_000_000
+    monkeypatch.setattr(config_flow.time, "time_ns", lambda: now_ms * 1_000_000)
+    credential_reader.side_effect = [
+        None,
+        None,
+        UnlockCredential(2, "00001234"),
+        UnlockCredential(3, "87654321"),
+    ]
+    locks = [
+        DiscoveredLock(
+            LOCK[CONF_DEVICE_ID],
+            LOCK[CONF_NODE_ID],
+            LOCK[CONF_NAME],
+            "HX201",
+            True,
+            product_id=HX201_PRODUCT_ID,
+        ),
+        DiscoveredLock(
+            "second-lock",
+            "secondnode",
+            "Second lock",
+            "HX201",
+            True,
+            product_id=HX201_PRODUCT_ID,
+        ),
+    ]
+    result = await cloud_to_selected_locks(hass, monkeypatch, locks)
+    assert result["step_id"] == "unlock_import" and not result["errors"]
+    assert result["description_placeholders"] == {"lock_name": LOCK[CONF_NAME]}
+    now_ms += 20_000
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {},
+    )
+    assert result["step_id"] == "unlock_import"
+    now_ms += 20_000
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {},
+    )
+    assert result["step_id"] == "lock_ready"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_NAME: "First cabinet"},
+    )
+    assert result["step_id"] == "lock_ready"
+    assert result["description_placeholders"] == {"lock_name": "Second lock"}
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_NAME: "Second cabinet"},
+    )
+    calls = credential_reader.await_args_list
+    assert [(call.args[-1], call.kwargs["since_ms"]) for call in calls] == [
+        (LOCK[CONF_DEVICE_ID], None),
+        (LOCK[CONF_DEVICE_ID], 1_800_000_000_000),
+        (LOCK[CONF_DEVICE_ID], 1_800_000_000_000),
+        ("second-lock", None),
+    ]
+    assert [
+        (lock[CONF_DEVICE_ID], lock[CONF_NODE_ID], lock[CONF_MEMBER], lock[CONF_REMOTE_CODE])
+        for lock in result["data"][CONF_LOCKS]
+    ] == [
+        (LOCK[CONF_DEVICE_ID], LOCK[CONF_NODE_ID], 2, "00001234"),
+        ("second-lock", "secondnode", 3, "87654321"),
+    ]
+    assert all(
+        lock[CONF_STATE_SOURCE] == STATE_SOURCE_HX201_DP40 for lock in result["data"][CONF_LOCKS]
+    )
+    flow_mocks.unlock.assert_not_called()
+    await hass.async_block_till_done()
+
+
+async def test_automatic_import_retry_has_no_technical_fallback_fields(
+    hass, monkeypatch, credential_reader
+):
+    """Only the explicit advanced entry point exposes manual credentials."""
+    credential_reader.side_effect = [None, UnlockCredential(2, "00001234")]
+    result = await cloud_to_selected_locks(hass, monkeypatch)
+    assert result["step_id"] == "unlock_import" and not result["data_schema"].schema
+    for value in (
+        {"next_action": "manual"},
+        {"next_action": "status_only"},
+        {CONF_REMOTE_CODE: "12345678"},
+    ):
+        with pytest.raises(InvalidData):
+            await hass.config_entries.flow.async_configure(result["flow_id"], value)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["step_id"] == "lock_ready"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_NAME: LOCK[CONF_NAME]}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("structured", [True, False])
+async def test_import_error_is_sanitized_and_retains_fallback_choices(
+    hass,
+    monkeypatch,
+    credential_reader,
+    structured,
+):
+    """Neither API failures nor their raw messages reveal credentials in the form."""
+    credential_reader.side_effect = CloudError(
+        "PRIVATE_RESPONSE",
+        **({"stage": "unlock_logs", "reason": "api_error", "code": "1106"} if structured else {}),
+    )
+    result = await cloud_to_selected_locks(hass, monkeypatch)
+    assert result["step_id"] == "unlock_import"
+    assert result["errors"] == {
+        "base": "cloud_request_failed" if structured else "unlock_import_failed",
+    }
+    if structured:
+        assert result["description_placeholders"]["stage"] == (
+            "reading a lock's recent unlock commands"
+        )
+        assert result["description_placeholders"]["reference"] == "(Tuya error 1106)"
+    for secret in ("PRIVATE_RESPONSE", CLOUD["client_id"], CLOUD["client_secret"]):
+        assert secret not in repr(result)
+    assert result["data_schema"]({}) == {}
+    credential_reader.assert_awaited_once()
+
+
+@pytest.mark.parametrize("imported", [True, False])
+async def test_aborting_flow_discards_cloud_access_and_pending_unlock_credentials(
+    hass,
+    monkeypatch,
+    credential_reader,
+    imported,
+):
+    """Both retry and confirmation screens release secrets when their flow is cancelled."""
+    credential_reader.return_value = UnlockCredential(2, "00001234") if imported else None
+    result = await cloud_to_selected_locks(hass, monkeypatch)
+    flow = hass.config_entries.flow._progress[result["flow_id"]]
+    assert flow._cloud_access is not None
+    assert flow._pending
+    hass.config_entries.flow.async_abort(result["flow_id"])
+    assert flow._cloud_access is None
+    assert not flow._pending and not flow._auto_lock_ids and not flow._import_since_ms
+    assert not flow._import_errors and not flow._import_placeholders
+    assert hass.config_entries.async_entries(DOMAIN) == []
+
+
+async def test_manual_identification_does_not_import_without_cloud_verification(
+    hass,
+    credential_reader,
+):
+    """Selecting the HX201 state profile alone cannot opt a lock into cloud import."""
+    result = await manual_to_credentials(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "HX201",
+            CONF_PROFILE: True,
+            CONF_MEMBER: 1,
+            CONF_STATE_SOURCE: STATE_SOURCE_HX201_DP40,
+        },
+    )
+    assert result["step_id"] == "manage"
+    credential_reader.assert_not_awaited()
+
+
+@pytest.mark.parametrize("late_error", [True, False])
+async def test_cancelled_import_does_not_restore_secrets_after_a_late_cloud_reply(
+    hass,
+    monkeypatch,
+    credential_reader,
+    late_error,
+):
+    """A cloud request already in flight cannot restore cleared flow state."""
+    result = await cloud_to_selected_locks(hass, monkeypatch)
+    flow = hass.config_entries.flow._progress[result["flow_id"]]
+    requested = asyncio.Event()
+    finish_request = asyncio.Event()
+
+    async def slow_read(*args, **kwargs):
+        requested.set()
+        await finish_request.wait()
+        if late_error:
+            raise CloudError("PRIVATE_RESPONSE", stage="unlock_logs", reason="timeout")
+        return UnlockCredential(3, "00001234")
+
+    credential_reader.side_effect = slow_read
+    request = asyncio.create_task(
+        hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {},
+        )
+    )
+    await requested.wait()
+    hass.config_entries.flow.async_abort(result["flow_id"])
+    finish_request.set()
+    with pytest.raises(UnknownFlow):
+        await request
+    assert flow._cloud_access is None and not flow._pending
+    assert not flow._import_errors and not flow._import_placeholders
+    assert not flow._auto_lock_ids and not flow._import_since_ms
+    assert hass.config_entries.async_entries(DOMAIN) == []
+
+
+@pytest.mark.parametrize("late_error", [True, False])
+async def test_cancelled_discovery_does_not_restore_cloud_access_after_a_late_reply(
+    hass,
+    monkeypatch,
+    late_error,
+):
+    """Cancelling the first cloud step also prevents later retention of API secrets."""
+    requested = asyncio.Event()
+    finish_request = asyncio.Event()
+
+    async def slow_discovery(*args):
+        requested.set()
+        await finish_request.wait()
+        if late_error:
+            raise CloudError("PRIVATE_RESPONSE", stage="token", reason="timeout")
+        return discovered_gateway(
+            GATEWAY[CONF_GATEWAY_ID],
+            GATEWAY[CONF_NAME],
+            GATEWAY[CONF_LOCAL_KEY],
+            [],
+        )
+
+    monkeypatch.setattr(config_flow, "async_discover_gateway", slow_discovery)
+    result = await start(hass, "cloud")
+    flow = hass.config_entries.flow._progress[result["flow_id"]]
+    request = asyncio.create_task(
+        hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    )
+    await requested.wait()
+    hass.config_entries.flow.async_abort(result["flow_id"])
+    finish_request.set()
+    with pytest.raises(UnknownFlow):
+        await request
+    assert flow._cloud_access is None and not flow._auto_lock_ids
+    assert CONF_LOCAL_KEY not in flow._data
+
+
+async def test_verified_product_without_supported_model_cannot_trigger_log_import(
+    hass,
+    monkeypatch,
+    credential_reader,
+):
+    """An exact product ID does not replace validation of its writable DP61 model."""
+    discovery = discovered_gateway(
+        GATEWAY[CONF_GATEWAY_ID],
+        GATEWAY[CONF_NAME],
+        GATEWAY[CONF_LOCAL_KEY],
+        [
+            DiscoveredLock(
+                LOCK[CONF_DEVICE_ID],
+                LOCK[CONF_NODE_ID],
+                "HX201",
+                "HX201",
+                False,
+                product_id=HX201_PRODUCT_ID,
+            )
+        ],
+    )
+    monkeypatch.setattr(config_flow, "async_discover_gateway", AsyncMock(return_value=discovery))
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    assert result["step_id"] == "no_locks"
+    credential_reader.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "host,local_key,reuse_connection",
+    [
+        (GATEWAY[CONF_HOST], GATEWAY[CONF_LOCAL_KEY], True),
+        ("192.0.2.20", GATEWAY[CONF_LOCAL_KEY], False),
+        (GATEWAY[CONF_HOST], "abcdef0123456789", False),
+    ],
+)
+async def test_automatic_reconfigure_keeps_saved_protocol_and_serializes_lan_probe(
+    hass, monkeypatch, flow_mocks, host, local_key, reuse_connection
+):
+    """A known stored version wins over product defaults and never opens a competing socket."""
+    config_entry = entry(
+        hass, **{CONF_VERSION: "3.4", CONF_AREAS: {LOCK[CONF_DEVICE_ID]: "existing-area"}}
+    )
+    original = deepcopy(dict(config_entry.data))
+    config_entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+    coordinator = MagicMock()
+    coordinator.async_probe = AsyncMock(return_value=flow_mocks.probe.return_value)
+    config_entry.runtime_data = coordinator
+    monkeypatch.setattr(hass.config_entries, "async_reload", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        config_flow,
+        "async_discover_gateway",
+        AsyncMock(
+            return_value=discovered_gateway(
+                GATEWAY[CONF_GATEWAY_ID], "Cloud gateway name", local_key, []
+            )
+        ),
+    )
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": config_entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "cloud"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {**{key: value for key, value in CLOUD.items() if key != CONF_GATEWAY_ID}, CONF_HOST: host},
+    )
+    assert result["step_id"] == "gateway_ready"
+    assert config_entry.data == original
+    coordinator.async_probe.assert_awaited_once_with(flow_mocks, reuse_connection=reuse_connection)
+    flow_mocks.probe.assert_not_called()
+    config_flow.GatewayClient.assert_called_once_with(
+        host, GATEWAY[CONF_GATEWAY_ID], local_key, 3.4
+    )
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["reason"] == "reconfigure_successful"
+    assert config_entry.data[CONF_LOCKS] == original[CONF_LOCKS]
+    assert config_entry.data[CONF_AREAS] == original[CONF_AREAS]
+    assert config_entry.data[CONF_VERSION] == "3.4"
+    assert config_entry.data[CONF_HOST] == host
+    assert config_entry.data[CONF_LOCAL_KEY] == local_key
+
+
+async def test_empty_cloud_search_keeps_staged_last_lock_removal_and_area_cleanup(
+    hass, monkeypatch
+):
+    """Advanced editing must remain saveable after removing the final lock and searching again."""
+    config_entry = entry(hass, **{CONF_AREAS: {LOCK[CONF_DEVICE_ID]: "existing-area"}})
+    monkeypatch.setattr(hass.config_entries, "async_reload", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        config_flow,
+        "async_discover_gateway",
+        AsyncMock(
+            return_value=discovered_gateway(
+                GATEWAY[CONF_GATEWAY_ID], GATEWAY[CONF_NAME], GATEWAY[CONF_LOCAL_KEY], []
+            )
+        ),
+    )
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": config_entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "gateway"}
+    )
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "remove_lock"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_DEVICE_ID: LOCK[CONF_DEVICE_ID]}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "cloud"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {key: value for key, value in CLOUD.items() if key != CONF_GATEWAY_ID}
+    )
+    assert result["step_id"] == "no_locks_manual" and result["last_step"] is False
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["step_id"] == "manage"
+    assert config_entry.data[CONF_LOCKS] == [LOCK]
+    assert config_entry.data[CONF_AREAS] == {LOCK[CONF_DEVICE_ID]: "existing-area"}
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
+    )
+    assert result["reason"] == "reconfigure_successful"
+    assert config_entry.data[CONF_LOCKS] == []
+    assert config_entry.data[CONF_AREAS] == {}
+
+
+async def test_automatic_lan_failure_returns_simple_form_without_retaining_cloud_access(
+    hass, monkeypatch, flow_mocks
+):
+    flow_mocks.probe.side_effect = LocalError("PRIVATE_LOCAL_KEY")
+    monkeypatch.setattr(
+        config_flow,
+        "async_discover_gateway",
+        AsyncMock(
+            return_value=discovered_gateway(
+                GATEWAY[CONF_GATEWAY_ID], GATEWAY[CONF_NAME], GATEWAY[CONF_LOCAL_KEY], []
+            )
+        ),
+    )
+    result = await start(hass, "cloud")
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CLOUD)
+    assert result["step_id"] == "cloud"
+    assert result["errors"] == {"base": "cannot_connect_automatic"}
+    assert "PRIVATE_LOCAL_KEY" not in repr(result)
+    flow = hass.config_entries.flow._progress[result["flow_id"]]
+    assert flow._cloud_access is None and CONF_LOCAL_KEY not in flow._data
+    assert hass.config_entries.async_entries(DOMAIN) == []
+
+
+@pytest.mark.parametrize("late_error", [True, False])
+async def test_cancelled_automatic_lan_probe_cannot_restore_cloud_or_config_state(
+    hass, monkeypatch, flow_mocks, late_error
+):
+    """Cancellation stays final even when the serialized gateway check finishes later."""
+    config_entry = entry(hass)
+    config_entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+    original = deepcopy(dict(config_entry.data))
+    requested = asyncio.Event()
+    finish_request = asyncio.Event()
+
+    async def probe(*args, **kwargs):
+        requested.set()
+        await finish_request.wait()
+        if late_error:
+            raise LocalError("PRIVATE_LOCAL_KEY")
+        return flow_mocks.probe.return_value
+
+    coordinator = MagicMock()
+    coordinator.async_probe = AsyncMock(side_effect=probe)
+    config_entry.runtime_data = coordinator
+    monkeypatch.setattr(
+        config_flow,
+        "async_discover_gateway",
+        AsyncMock(
+            return_value=discovered_gateway(
+                GATEWAY[CONF_GATEWAY_ID], "Changed gateway", "abcdef0123456789", []
+            )
+        ),
+    )
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": config_entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "cloud"}
+    )
+    flow = hass.config_entries.flow._progress[result["flow_id"]]
+    request = asyncio.create_task(
+        hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {key: value for key, value in CLOUD.items() if key != CONF_GATEWAY_ID},
+        )
+    )
+    await requested.wait()
+    hass.config_entries.flow.async_abort(result["flow_id"])
+    finish_request.set()
+    with pytest.raises(UnknownFlow):
+        await request
+    assert flow._cloud_access is None and not flow._pending
+    assert flow._data == original and config_entry.data == original
+    assert not flow._auto_lock_ids

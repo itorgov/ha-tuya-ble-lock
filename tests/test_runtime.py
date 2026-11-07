@@ -10,12 +10,13 @@ import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.tuya_ble_lock.const import DOMAIN
+from custom_components.tuya_ble_lock.const import CONF_AREAS, DOMAIN
 from custom_components.tuya_ble_lock.coordinator import GatewayCoordinator
 from custom_components.tuya_ble_lock.diagnostics import async_get_config_entry_diagnostics
 from custom_components.tuya_ble_lock.local import (
@@ -57,6 +58,110 @@ async def test_setup_registry_unlock_and_unload(hass, entry_data, mock_gateway):
     assert mock_gateway["unlock"].call_count == 1
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert mock_gateway["close"].call_count == 1
+
+
+async def test_selected_areas_assign_each_new_lock_to_its_own_room(
+    hass,
+    entry_data,
+    mock_gateway,
+):
+    """Stored area IDs become real device areas independently for each lock."""
+    areas = ar.async_get(hass)
+    first_area = areas.async_create("First room")
+    second_area = areas.async_create("Second room")
+    areas.async_update(first_area.id, name="Renamed first room")
+    entry_data[CONF_AREAS] = {"test_lock": first_area.id, "other_lock": second_area.id}
+    entry_data["locks"].append(
+        {
+            "device_id": "other_lock",
+            "node_id": "other_node",
+            "name": "Other lock",
+            "member": 2,
+            "remote_unlock_code": None,
+        }
+    )
+    mock_gateway["poll"].return_value = {
+        "test_node": LockStatus(True, 72),
+        "other_node": LockStatus(True, 61),
+    }
+    entry = await setup_entry(hass, entry_data)
+    devices = dr.async_get(hass)
+    first = devices.async_get_device_by_identifier((DOMAIN, "test_lock"), entry.entry_id)
+    second = devices.async_get_device_by_identifier((DOMAIN, "other_lock"), entry.entry_id)
+    gateway = devices.async_get_device_by_identifier((DOMAIN, "test_gateway"), entry.entry_id)
+    assert first.area_id == first_area.id
+    assert second.area_id == second_area.id
+    assert gateway.area_id is None
+    assert {area.name for area in areas.async_list_areas()} == {
+        "Renamed first room",
+        "Second room",
+    }
+    registry = er.async_get(hass)
+    for device_id, area_id in entry_data[CONF_AREAS].items():
+        for domain, unique_id in (("lock", device_id), ("sensor", f"{device_id}_battery")):
+            entity_id = registry.async_get_entity_id(domain, DOMAIN, unique_id)
+            assert er.async_get_effective_area_id(hass, registry.async_get(entity_id)) == area_id
+    diagnostic = json.dumps(await async_get_config_entry_diagnostics(hass, entry))
+    assert first_area.id not in diagnostic and second_area.id not in diagnostic
+    assert "Renamed first room" not in diagnostic
+    mock_gateway["unlock"].assert_not_called()
+
+
+@pytest.mark.parametrize("selection", ["missing", "empty", "deleted"])
+async def test_missing_or_deleted_area_does_not_create_a_room(
+    hass, entry_data, mock_gateway, selection
+):
+    """Legacy entries, no selection and a deleted selection all leave the device unassigned."""
+    areas = ar.async_get(hass)
+    if selection == "empty":
+        entry_data[CONF_AREAS] = {}
+    elif selection == "deleted":
+        area = areas.async_create("Deleted room")
+        entry_data[CONF_AREAS] = {"test_lock": area.id}
+        areas.async_delete(area.id)
+    entry = await setup_entry(hass, entry_data)
+    device = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, "test_lock"), entry.entry_id
+    )
+    assert device.area_id is None
+    assert not list(areas.async_list_areas())
+
+
+@pytest.mark.parametrize("clear_area", [True, False])
+async def test_reload_preserves_user_area_changes(hass, entry_data, mock_gateway, clear_area):
+    """An initial setup selection cannot override a later move or explicit removal."""
+    areas = ar.async_get(hass)
+    initial_area = areas.async_create("Initial room")
+    new_area = areas.async_create("User selected room")
+    entry_data[CONF_AREAS] = {"test_lock": initial_area.id}
+    entry = await setup_entry(hass, entry_data)
+    devices = dr.async_get(hass)
+    device = devices.async_get_device_by_identifier((DOMAIN, "test_lock"), entry.entry_id)
+    assert device.area_id == initial_area.id
+    selected_id = None if clear_area else new_area.id
+    devices.async_update_device(device.id, area_id=selected_id)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    reloaded = devices.async_get_device_by_identifier((DOMAIN, "test_lock"), entry.entry_id)
+    assert reloaded.id == device.id and reloaded.area_id == selected_id
+    assert entry.data[CONF_AREAS] == {"test_lock": initial_area.id}
+
+
+async def test_reload_does_not_recreate_a_deleted_selected_area(hass, entry_data, mock_gateway):
+    """Deleting the original room remains effective after reloading the integration."""
+    areas = ar.async_get(hass)
+    area = areas.async_create("Removed room")
+    entry_data[CONF_AREAS] = {"test_lock": area.id}
+    entry = await setup_entry(hass, entry_data)
+    areas.async_delete(area.id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    device = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, "test_lock"), entry.entry_id
+    )
+    assert device.area_id is None
+    assert not list(areas.async_list_areas())
 
 
 async def test_missing_code_and_action_code(hass, entry_data, mock_gateway):

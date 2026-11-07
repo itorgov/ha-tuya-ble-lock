@@ -3,10 +3,11 @@
 from dataclasses import replace
 
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import CONF_AREAS, DOMAIN
 from .coordinator import GatewayCoordinator
 from .local import LocalError, LockConfig, LockStatus
 
@@ -28,6 +29,11 @@ class TuyaLockEntity(CoordinatorEntity[GatewayCoordinator]):
             model="BLE lock (DP61)",
             via_device_id=coordinator.gateway_device_id,
         )
+        if area_id := coordinator.config_entry.data.get(CONF_AREAS, {}).get(lock.device_id):
+            if area := ar.async_get(coordinator.hass).async_get_area(area_id):
+                # HA applies suggestions only when creating a new device, so
+                # later user changes to its area survive integration reloads.
+                self._attr_device_info["suggested_area"] = area.name
 
     @property
     def lock_status(self) -> LockStatus | None:
