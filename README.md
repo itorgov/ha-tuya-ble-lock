@@ -1,119 +1,95 @@
 # Tuya BLE Lock for Home Assistant
 
-Unlock compatible Tuya Bluetooth cabinet and drawer locks from Home Assistant through a Wi-Fi/Bluetooth gateway. Each lock appears as a separate device with a lock entity and a battery sensor, ready for dashboards, scripts, and automations.
+Open compatible Tuya Bluetooth drawer and cabinet locks from Home Assistant, including from a dashboard or a wireless-button automation. Each lock gets its own device page, unlock control, battery level, and reported locked/unlocked state.
 
-Requires **Home Assistant 2026.10 or newer**.
+You need **Home Assistant 2026.10 or newer**, a compatible lock, and a **Wi-Fi/Bluetooth gateway** (also called a hub). The gateway connects the Bluetooth locks to your home network. Home Assistant does not need a Bluetooth adapter.
 
 ```text
-Home Assistant ── local network ── Tuya gateway ── Bluetooth ── lock
+Home Assistant → home network → gateway → Bluetooth lock
 ```
 
-Commands and state updates use the local network. Tuya Cloud is used during setup to retrieve gateway credentials and discover locks; its API credentials are not saved. Home Assistant does not need a Bluetooth adapter.
+Setup uses your Tuya account to find the devices and retrieve connection details. After setup, this integration sends commands and receives updates directly through your home network.
 
 ## Supported devices
 
-The following gateway and lock are supported together using Tuya LAN protocol **3.5**:
+These devices have been verified together:
 
-| Device | Retail brand / model | Model reported by Tuya | Tuya Product ID (PID) |
+| Device | Name on the product | Name in Tuya | Tuya Product ID |
 | --- | --- | --- | --- |
-| Wi-Fi/Bluetooth gateway | **MOES BHUB-C** — Wireless Smart Gateway (BLE) | `CR3L Bluetooth Gateway` | `csvxfq3ecmedidkh` |
-| Bluetooth drawer/cabinet lock | **T1 tuya** — labeled "Smart Drawer Switch" on the packaging | `HX201_BLE_LOCKER` | `ahz7wpy9` |
+| Gateway | **MOES BHUB-C** — Wireless Smart Gateway (BLE) | `CR3L Bluetooth Gateway` | `csvxfq3ecmedidkh` |
+| Drawer/cabinet lock | **T1 tuya** — "Smart Drawer Switch" | `HX201_BLE_LOCKER` | `ahz7wpy9` |
 
-Check the Tuya **Product ID** as well as the retail model. It identifies a product profile; the **Device ID** requested during setup identifies your individual device.
+The **Product ID** identifies a model. A **Device ID** identifies one particular gateway or lock; those are the IDs requested during setup. You can check them in the device details on the Tuya Developer Platform described below.
 
-## Features and compatibility
+Other Tuya locks are not automatically compatible. They must use the same remote-unlock command format; see [compatibility details](#compatibility-details). The lock closes itself: this integration supports unlocking, not a remote **Lock** command.
 
-This integration supports the **HX201-style DP61 remote-unlock protocol** (`remote_no_dp_key`). Other devices must use this protocol and have an existing eight-digit remote unlock code. Tuya branding or successful discovery alone does not establish compatibility. LAN protocols 3.3 and 3.4 are configurable but have not been verified on hardware with this integration.
+## Where to start
 
-- Unlock through the standard Home Assistant `lock.unlock` action.
-- View reported locked/unlocked state and battery percentage.
-- Record state changes, including automatic relocking, in Home Assistant history and Activity.
-- Add multiple gateways, with a separate device for each configured lock.
+| What you want to do | Follow this guide |
+| --- | --- |
+| Install the integration and add your first locks | [First-time setup](#first-time-setup) |
+| Add new locks to a gateway already in Home Assistant | [Add more locks to an existing gateway](#add-more-locks-to-an-existing-gateway) |
+| Find the value needed to make a lock open | [Find your lock's unlock information](docs/remote-unlock-code.md) |
+| Understand the fields on the lock setup screen | [Fill in the lock form](#fill-in-the-lock-form) |
+| Change an existing lock's code or state setting | [Change a lock's settings](#change-a-locks-settings) |
 
-Locking is handled by the lock itself; a remote locking command is not supported. The integration does not pair devices, create unlock codes, or register users, fingerprints, or cards. It never automatically retries an unlock: if a command times out, inspect the lock before trying again.
+The instructions use English button names. **Submit** advances a form; **Save** in the final **Manage locks** menu saves the whole setup.
 
-The gateway must be reachable at a private IPv4 address from Home Assistant, with TCP port **6668** allowed. Reserve its IP address in your router and do not expose this port to the internet.
+## First-time setup
 
-## Setup
+Follow these sections in order. If your devices already work through the gateway in Tuya Smart or Smart Life, start with installation. If the integration is already installed, start with [Tuya cloud access](#prepare-tuya-cloud-access).
 
-Follow these steps for a new installation. If you already have the gateway local key, protocol version, lock identifiers, and remote unlock code, go to [installation](#5-install-the-integration), then [manual setup](#manual-setup).
+### Set up the devices in the phone app
 
-### 1. Set up the gateway and locks in the mobile app
+1. Install **Tuya Smart** or **Smart Life**, whichever your device manual specifies. Create an account, sign in, and create a home if asked.
+2. Connect your phone to the Wi-Fi network intended for the gateway, usually **2.4 GHz**. Enable Bluetooth and the nearby-device permissions requested by the app.
+3. Follow the gateway manual to put it in pairing mode. In the app, use **+ → Add Device** to add the gateway and connect it to Wi-Fi.
+4. Put each lock in pairing mode and add it in the same app. Complete any owner/administrator setup requested by the lock.
+5. Open the **gateway's device page** in the app. Use **Add sub-device** or **Add device by list** to associate the locks with it; labels vary by gateway. Each lock must appear in the gateway's list of devices.
+6. Stand beside a lock, turn off Bluetooth in your phone's settings, and unlock it from the app. Repeat for each lock. This checks that commands work through the gateway, rather than directly from the phone.
 
-1. Install **Tuya Smart** or **Smart Life**, as specified by the device manufacturer. Register a permanent account, sign in, and create a home if requested. Use the same account throughout setup.
-2. Enable Bluetooth and the app's requested nearby-device permissions. Connect your phone to the gateway's supported Wi-Fi network, normally **2.4 GHz**.
-3. Power the gateway and put it in pairing mode following its manual. In the app, choose **+ → Add Device** and add the Bluetooth gateway; the manual category is usually **Gateway Control → Wireless Gateway (Bluetooth)**. Enter your Wi-Fi credentials and finish pairing. [Tuya's gateway instructions](https://support.tuya.com/en/help/_detail/K9hut3ffwx4az).
-4. Put each lock in pairing mode and add it **inside the app**, not in the phone's Bluetooth settings. Finish any administrator/owner setup required by the lock. [Tuya's lock instructions](https://support.tuya.com/en/help/_detail/K9hw4ebtzv7rb).
-5. Open the gateway's device page and add/bind each lock through **Add sub-device** or **Add device by list**, depending on the gateway panel. Verify that each lock is listed under that gateway. Follow the product manual if its binding sequence differs. [Tuya's sub-device workflow](https://developer.tuya.com/en/docs/iot-device-dev/tuyaos-gateway-join?id=Kc3234gqbhjjt).
-6. While beside the lock, disable your phone's Bluetooth and unlock through the app. This checks the gateway connection. If it fails, resolve pairing, range, batteries, or remote-unlock settings before continuing. Note the time of a successful unlock; you may need its command log in step 4.
+**Before continuing:** each lock must open with the phone's Bluetooth off. If it does not, check its batteries, distance from the gateway, and the device manual. Adding a lock only in the phone's Bluetooth settings is insufficient. See Tuya's [gateway setup](https://support.tuya.com/en/help/_detail/K9hut3ffwx4az) and [gateway device-binding guide](https://developer.tuya.com/en/docs/iot-device-dev/tuyaos-gateway-join?id=Kc3234gqbhjjt).
 
-### 2. Create and authorize a Tuya cloud project
+### Install the integration
 
-The developer account is separate from the mobile-app account. Linking the app in the next step gives the project access to your devices.
+Choose **one** method. Installation makes Tuya BLE Lock available in Home Assistant; you will add your gateway and locks afterward.
 
-1. Register/sign in at the [Tuya Developer Platform](https://platform.tuya.com/).
-2. Open **Cloud → Development** (also shown as **Project Management**) and select **Create Cloud Project**.
-3. Enter a name, choose **Smart Home** as the development method, and select the data center serving your **app account's registered region**. Check that region in the app under **Me → Settings → Account and Security → Region**. Use [Tuya's region/data-center mapping](https://developer.tuya.com/en/docs/iot/oem-app-data-center-distributed?id=Kafi0ku9l07qb), including its notes for older accounts; do not infer the data center from your current location.
-4. Accept the Smart Home API services offered by the wizard. Tuya currently lists **Industry Basic Service**, **Smart Home Basic Service**, and **Device Status Notification**. Copy the project's **Access ID / Client ID** and **Access Secret / Client Secret** from **Overview** into a password manager. [Official project wizard](https://developer.tuya.com/en/docs/iot/Platform_Configuration_smarthome?id=Kamcgamwoevrx).
-5. Under **Service API**, ensure the project is authorized for **IoT Core** and **Authorization** / **Authorization Token Management**, plus the device-management services above. If missing, use **Go to Authorize**. Subscribing to a service and authorizing this project are separate steps. You can inspect available services under **Cloud → Cloud Services → My Service**. [API authorization instructions](https://developer.tuya.com/en/docs/iot/applying-for-api-group-permissions?id=Ka6vf012u6q76).
+#### Home Assistant 2026.11 or newer: Marketplace
 
-Tuya can change service names, eligibility, quotas, and trial terms. Check the subscriptions shown for your account; a developer project does not guarantee permanent free API access. Expired cloud access affects discovery and credential retrieval, not already configured local commands while the local credentials remain valid.
+The Marketplace is built into Home Assistant and replaces HACS. Use an administrator account.
 
-### 3. Link the mobile-app account and collect the gateway details
+1. Open **Settings → Marketplace** and accept the community-content notice if prompted.
+2. Select **Add from link** and enter `https://github.com/itorgov/ha-tuya-ble-lock`.
+3. If asked, connect your GitHub account using the displayed link and code, then return to Home Assistant.
+4. Select **Add**. If a content type is requested, choose **Integration**.
+5. Open **Tuya BLE Lock**, select **Install**, review the version, and confirm.
+6. Restart if Home Assistant requests it. If the gateway setup opens immediately, you can close it and return after collecting the Tuya details below.
 
-1. In your project, open **Devices → Link Tuya App Account → Add App Account**. Use this option for Tuya Smart/Smart Life, not **Link My App**, which is for apps you develop.
-2. Scan the displayed QR code with the scanner **inside the same mobile app/account** used in step 1. Confirm the authorization on the phone.
-3. Select automatic device linking, or explicitly include the gateway and all intended locks if using manual linking.
-4. Open **All Devices**, select the matching data center, and confirm that both the gateway and locks appear. If the list is empty, check the app account, data center, and linking permissions. [Official account-linking instructions](https://developer.tuya.com/en/docs/iot/link-devices?id=Ka471nu1sfmkl).
-5. Copy the **gateway's Device ID**. This is different from each lock's Device ID. Find the gateway's local IP address in your router's client/DHCP list and reserve it.
-6. Obtain its LAN protocol version. If you do not know it, run a read-only [TinyTuya network scan](https://github.com/jasonacox/tinytuya#network-scanner) on a computer on the same LAN:
+See the [official Marketplace guide](https://www.home-assistant.io/integrations/marketplace/#custom-repositories). If upgrading from HACS, existing installations migrate automatically; you do not need to add them again.
 
-   ```sh
-   python3 -m venv .venv
-   . .venv/bin/activate
-   python -m pip install tinytuya==1.20.0
-   python -m tinytuya scan
-   ```
+#### Home Assistant 2026.10: HACS
 
-   On Windows, activate with `.venv\Scripts\activate`. The scan reports the gateway ID, IP, and version. Broadcast discovery needs UDP 6666, 6667, and 7000 on that LAN; the integration itself connects directly to the configured IP.
+HACS is the community integration manager used before the Marketplace. If you do not have it on Home Assistant 2026.10, follow the [HACS installation and setup guide](https://www.hacs.xyz/docs/use/).
 
-### 4. Obtain each lock's remote unlock code
+1. Open **HACS** in Home Assistant.
+2. Open its **⋮** menu → **Custom repositories**.
+3. Enter `https://github.com/itorgov/ha-tuya-ble-lock`, choose type **Integration**, and select **Add**.
+4. Find **Tuya BLE Lock** in HACS, open it, and select **Download**.
+5. Restart Home Assistant.
 
-Three credentials have different purposes:
+See the [HACS custom-repository guide](https://www.hacs.xyz/docs/faq/custom_repositories/) if the menu is unfamiliar.
 
-| Value | Purpose | Where it comes from |
-| --- | --- | --- |
-| Project Access ID and Secret | Read Tuya Cloud during discovery | Cloud project → Overview |
-| Gateway local key | Encrypt the connection to the gateway | Retrieved during cloud setup; manual alternative below |
-| Lock remote unlock code and member number | Authorize the DP61 unlock command | Existing lock configuration or a successful app command log |
+<details>
+<summary>Manual installation without HACS</summary>
 
-The remote unlock code is exactly **eight digits**, including leading zeroes. It is not the gateway local key, your app password, a lock user ID, or necessarily the PIN typed on the lock's keypad. Do not substitute an arbitrary eight-digit value.
-
-If the manufacturer's app exposes the existing DP61 remote code and member number, use them. Otherwise, inspect **your own successful gateway-based app unlock** in the Tuya device command logs:
-
-1. Note the time of the successful app unlock from step 1.
-2. Open **Cloud → API Explorer**, select your project, and locate **Query device logs** for the **lock Device ID**. Query a narrow time range around that action, with log types `5,7`; if offered, filter the code to `remote_no_dp_key`.
-3. Find the **outgoing command** for `remote_no_dp_key` / DP61, not its short response. Copy its Base64 value privately.
-4. During lock configuration, paste it into **Existing DP61 command (Base64)**; the integration extracts the member and code locally. Alternatively, enter the code and member directly.
-
-See the [detailed log-query instructions](docs/remote-unlock-code.md) for the API request and supported command format. If your product hides this value, uses a different format, or changes the code, you need a currently valid compatible code before this integration can unlock it.
-
-### 5. Install the integration
-
-Choose HACS or manual installation. HACS is optional.
-
-#### HACS
-
-1. [Install and configure HACS](https://www.hacs.dev/docs/use/download/download/) if needed.
-2. In **HACS → ⋮ → Custom repositories**, add `https://github.com/itorgov/ha-tuya-ble-lock` with type **Integration**.
-3. Find **Tuya BLE Lock**, download it, and restart Home Assistant. See [HACS custom repository instructions](https://www.hacs.dev/docs/faq/custom_repositories/).
-
-#### Manual installation
-
-1. Download this repository and copy `custom_components/tuya_ble_lock` into your Home Assistant configuration directory:
+1. On [this repository's GitHub page](https://github.com/itorgov/ha-tuya-ble-lock), choose **Code → Download ZIP** and extract it on your computer.
+2. Open the **Home Assistant configuration folder** on the machine running Home Assistant. This is the folder containing `configuration.yaml`, normally `/config` on Home Assistant OS.
+3. Create a `custom_components` folder there if it does not exist. From the downloaded files, copy the entire `custom_components/tuya_ble_lock` folder into it.
+4. Check the resulting structure, then restart Home Assistant:
 
    ```text
    config/
+     configuration.yaml
      custom_components/
        tuya_ble_lock/
          __init__.py
@@ -121,55 +97,124 @@ Choose HACS or manual installation. HACS is optional.
          ...
    ```
 
-2. Restart Home Assistant. It installs the integration's Python dependencies automatically; no manual TinyTuya installation inside Home Assistant is needed.
+If Home Assistant OS runs on a separate server, the files must be copied to **that server**, not left on your computer. Use your existing file-access method, or follow Home Assistant's [file-access instructions](https://www.home-assistant.io/common-tasks/os/#configuring-access-to-files), which cover Samba and file-editor apps.
 
-### 6. Add the gateway and its locks
+Home Assistant installs the required Python packages automatically. You do not need to install TinyTuya yourself on the Home Assistant server or edit `configuration.yaml`.
+
+</details>
+
+### Prepare Tuya cloud access
+
+The **Tuya Developer Platform** is a website where you give this integration permission to read your device list. Its account is separate from your phone-app account. A **cloud project** is the container for those permissions; creating one does not require writing code.
+
+If you already have a project linked to the correct app account, reuse it. Check that the gateway and all intended locks appear under **Devices → All Devices**, then collect the values below.
+
+1. Register or sign in at the [Tuya Developer Platform](https://platform.tuya.com/).
+2. Open **Cloud → Development** (sometimes **Project Management**) → **Create Cloud Project**. Give it a name and choose development method **Smart Home**.
+3. Choose the **data center**, meaning the Tuya server region that holds your app account's devices. Find the account region in the phone app under **Me → Settings → Account and Security → Region**, then use [Tuya's region table](https://developer.tuya.com/en/docs/iot/oem-app-data-center-distributed?id=Kafi0ku9l07qb). Your current physical location is not necessarily the account region.
+4. Authorize the services offered by the Smart Home wizard: **Industry Basic Service**, **Smart Home Basic Service**, and **Device Status Notification**. See [Tuya's project-creation guide](https://developer.tuya.com/en/docs/iot/Platform_Configuration_smarthome?id=Kamcgamwoevrx).
+5. In the project, open **Devices → Link Tuya App Account → Add App Account**. Scan the QR code with the scanner **inside Tuya Smart or Smart Life**, using the same account that owns the devices, and confirm on the phone.
+6. Choose automatic device linking if offered. If you choose devices manually, include the gateway and every intended lock. Open **All Devices**, select the correct data center, and check that they appear. See [Tuya's account-linking guide](https://developer.tuya.com/en/docs/iot/link-devices?id=Ka471nu1sfmkl).
+
+Keep these values handy, preferably in a password manager:
+
+| Value | Where to find it | What you will use it for |
+| --- | --- | --- |
+| **Access ID / Client ID** | Project → **Overview** → authorization details | Home Assistant's Tuya discovery form |
+| **Access Secret / Client Secret** | Beside the Access ID | The same discovery form; treat it as a password |
+| **Project data center** | The data center where the project's device list shows your devices | Select the same region in Home Assistant |
+| **Gateway device ID** | Project → **Devices → All Devices** → your gateway's details | Identifies the hub; do not copy a lock's ID here |
+
+These are **not** your mobile-app login and password. Home Assistant does not save the project credentials, so you will need them again when discovering additional locks.
+
+If Tuya reports missing permissions, open the project's **Service API → Go to Authorize**. Check that the required services are both available to your account and authorized for this project; device access may be listed under **IoT Core**, and token access under **Authorization**. Tuya's [service-permission guide](https://developer.tuya.com/en/docs/iot/applying-for-api-group-permissions?id=Ka6vf012u6q76) explains the two steps. Service names, trial periods, and availability can vary. Expired cloud access prevents discovery but does not by itself stop already configured local unlocks.
+
+### Collect the gateway address and each lock's unlock information
+
+**Gateway address:** open your router's app or administration page and find its **Connected devices**, **Clients**, or **DHCP** list. Find the gateway and note its local IP address, such as `192.168.1.50` (an example, not a value to copy). Use the router's address-reservation option to keep it from changing. This must be the gateway's address, not Home Assistant's address or your public internet address.
+
+**Gateway connection version:** for the verified **MOES BHUB-C / CR3L** gateway above, use **3.5**. For another gateway, see [find the gateway connection version](#find-the-gateway-connection-version).
+
+**Each lock's unlock information:** discovery finds locks but does not retrieve the secret needed to open them. Follow [Find your lock's unlock information](docs/remote-unlock-code.md) for **each lock**. That guide shows how to copy a value from your own successful app unlock. Keep the value together with the name of the lock it belongs to; do not reuse another lock's value.
+
+You do not need to decode that value or understand the term *Base64*. You will paste it into **Existing DP61 command (Base64)**. If you already know the lock's existing eight-digit remote unlock code **and** its member number, you can enter those instead. The code is not your Tuya password, the gateway key, or necessarily a keypad PIN.
+
+### Add the gateway in Home Assistant
 
 1. Open **Settings → Devices & services → Add integration** and search for **Tuya BLE Lock**.
-2. Choose **Discover locks with Tuya Cloud**. Enter the project's Access ID, Secret, data center, and the **gateway Device ID**. This retrieves the gateway local key and its child devices.
-3. Enter the gateway's **local IP** and verified **LAN protocol version**. Leave the local-key field blank to retain the imported key.
-4. Select the compatible locks you want to add. For each lock, confirm the supported DP61 profile, choose **Lock state source** using the table below, and enter its remote code and member number or paste its Base64 command from step 4.
-5. Select **Save** in the lock-management menu. Each configured lock has its own device and `lock` entity, linked to the gateway. You can leave a code blank to complete discovery, but unlocking remains unavailable until you supply it. Repeat for another gateway.
+2. Choose **Discover locks with Tuya Cloud**.
+3. On **Read gateway details from Tuya**, enter the four values from the [cloud-access table](#prepare-tuya-cloud-access). Check **Project data center** carefully: the form initially selects **Central Europe**, which may be wrong for your account. Select **Submit**.
+4. On **Connect to the local gateway**, fill in:
 
-| Lock state source | When to use it |
+   | Field | What to enter |
+   | --- | --- |
+   | **Gateway name** | A name you will recognize, such as `Living room gateway` |
+   | **Gateway IPv4 address** | The gateway's local IP address from your router |
+   | **LAN protocol version** | **3.5** for the verified MOES gateway above |
+   | **Gateway Local Key** | **Leave blank.** The preceding cloud step has already retrieved it. This key is the gateway's connection password. |
+
+5. Select **Submit**. On **Select discovered locks**, select the locks you want to add, then submit.
+6. Complete [the lock form](#fill-in-the-lock-form) for each selected lock. Check the name each time so you paste the correct lock's unlock information.
+7. When **Manage locks** appears, choose **Save**. Closing the dialog before this step discards your changes.
+
+**You should now see:** the gateway and a separate device for every added lock under **Tuya BLE Lock**. Each lock has a control and a battery sensor. Home Assistant calls these individual controls and readings **entities**. Continue with [test an unlock](#test-an-unlock).
+
+## Fill in the lock form
+
+This is the **Configure lock status and unlock code** screen shown when adding or editing a lock. The simplest method is to paste the value obtained in the [unlock-information guide](docs/remote-unlock-code.md).
+
+| Field on the screen | What to do |
 | --- | --- |
-| **HX201 / T1 cabinet lock (DP40)** | The T1 / HX201 lock listed under Supported devices. Cloud discovery selects this for Product ID `ahz7wpy9`; select it yourself during manual setup. |
-| **Standard lock state (DP47)** | Other compatible locks that report their motor state through DP47. This is the default for manual setup. |
+| **Lock name** | Choose a recognizable name for this lock. |
+| **My lock uses the supported DP61 profile** | Turn **on** for the supported T1 / HX201 lock. This confirms that it uses the supported opening-command format. You must confirm this each time you submit this screen. For another model, first check [compatibility](#compatibility-details). |
+| **Lock state source** | For the supported T1 / HX201 lock, select **HX201 / T1 cabinet lock (DP40)**. This tells Home Assistant how to read whether it is locked. Cloud discovery normally selects it for the supported Product ID. |
+| **Member number** | When pasting a command below, leave this as shown: the correct number is extracted automatically. |
+| **Existing eight-digit remote unlock code** | Leave blank when pasting a command below. |
+| **Existing DP61 command (Base64)** | Paste **this lock's** copied value, without surrounding quotes or spaces. |
+| **Remove the saved unlock code** | Leave **off**. Turning it on removes the code, even if you fill the other credential fields. |
 
-Setup does not unlock anything. Make the first [unlock test](#unlock-from-the-interface) while beside the lock.
+**For the supported T1 lock, both settings are needed:** enable the **DP61** confirmation and select **DP40** as the state source. They control different things; they are not alternatives.
 
-### Manual setup
+If you know the eight-digit code and member number already, fill those two fields and leave the Base64 field blank. Keep any leading zeroes. Do not invent a code or assume the member number is `1`.
 
-Open **Settings → Devices & services → Add integration → Tuya BLE Lock** and choose **Enter local gateway details manually**. You need:
+Select **Submit**. Another selected lock's form may appear; complete it too. When you return to **Manage locks**, select **Save**.
 
-| Field | Required value |
-| --- | --- |
-| Gateway host | Its private IPv4 address on your LAN |
-| Gateway Device ID | The gateway's Tuya Device ID |
-| Gateway local key | Its exact 16-byte key, preserving punctuation |
-| Protocol version | The gateway's observed 3.3, 3.4, or 3.5 version |
-| Lock Device ID | The child's Tuya Device ID |
-| Child node ID | The exact `node_id` / `cid` used by this gateway |
-| Member | The member number from the DP61 command |
-| Remote unlock code | The existing eight-digit DP61 code |
+For a **new lock**, leaving both credential fields blank adds status reporting only; Home Assistant cannot unlock it until you supply the code. For an **existing lock**, blank credential fields keep its saved code. Saving this form never opens the lock.
 
-After the gateway check, choose **Add a lock manually**, enter the lock Device ID and exact child node ID, then complete the profile/code form using the state-source table above. The lock must appear in the gateway's device list. Repeat for each lock, then select **Save**.
+## Add more locks to an existing gateway
 
-To retrieve missing values, open **Cloud → API Explorer** for your project. **Get Device Information** / **Query Device Details** returns the gateway's `local_key`; device details and gateway sub-device queries provide the lock Device ID and `node_id`. The node ID is not interchangeable with the Device ID. A cloud-reported `ip` can be a public address; obtain the local address from your router. [Tuya device information API](https://developer.tuya.com/en/docs/cloud/7d3f13ae55?id=Kb2rzcwpmvaci).
+Use this when your gateway already appears under **Tuya BLE Lock** in Home Assistant. Adding a lock in the phone app does **not** automatically add it to this integration. You do not need to reinstall the integration or add the same gateway again.
+
+1. **On the phone:** add each new lock to the existing gateway's device list. Confirm it opens from the app with the phone's Bluetooth off.
+2. **On the Tuya website:** open your existing project → **Devices → All Devices**. Confirm the new locks appear in the correct data center. If your app account uses manual device linking, include the new locks in that linked account's device selection.
+3. Obtain [unlock information](docs/remote-unlock-code.md) for each **new** lock. Have the project's Access ID, Access Secret, and data center ready too; reuse the same project.
+4. **In Home Assistant:** open **Settings → Devices & services → Tuya BLE Lock**. Find the existing gateway under **Hubs**. Open the **⋮ menu on that gateway's integration entry** and choose **Reconfigure**. Use the gateway entry, not an individual lock's device page.
+5. Choose **Discover locks with Tuya Cloud**. Enter the Access ID and Secret again and select the correct **Project data center**; it defaults to Central Europe each time. The gateway ID is already saved, so this form does not ask for it again.
+6. On **Connect to the local gateway**, keep the saved gateway name, address, and protocol version unless they changed. Leave **Gateway Local Key** blank and submit.
+7. Select the new locks on **Select discovered locks**. Existing locks are deliberately omitted from this list; they keep their settings.
+8. Complete [the lock form](#fill-in-the-lock-form) for each new lock, then select **Save** in **Manage locks**.
+9. Open the newly added device pages and [test their unlock controls](#test-an-unlock) while beside the locks.
+
+**If you only see “Polling interval”:** you opened **Configure**, which changes how often the gateway is checked. Close it and use **⋮ → Reconfigure** instead.
+
+**If there are no new locks to select:** check the phone app's gateway list and the Tuya project's device list first. A lock already added to this integration is not offered again. Other models or locks whose Tuya details cannot be read may also be omitted; see [troubleshooting](#troubleshooting).
 
 ## Using your locks
 
-### Unlock from the interface
+### Test an unlock
 
-Click the lock entity's **name** and select the **open-padlock / Unlock** control. Alternatively, open **Developer tools → Actions → Lock: Unlock** and select the entity.
+1. Stand beside the lock.
+2. In Home Assistant, open **Settings → Devices & services → Tuya BLE Lock**, then the lock's device page.
+3. Click the lock control's **name** to open its popup. Select the **open-padlock / Unlock** control.
+4. Check that the lock opens and then closes itself. Reported state changes should appear in **Activity**, and the battery reading should appear once received from the gateway.
 
-The compact entity row may offer **Lock**. That action is unsupported; use the explicit **Unlock** control.
+The compact device-page row may show a **Lock** button. Use the popup's explicit **Unlock** control; remote locking is unsupported. If an unlock times out, inspect the lock before trying again: the command may have reached it, and the integration does not repeat it automatically.
 
-### Unlock from an automation
+### Open a lock with a wireless button
 
-In **Settings → Automations & scenes**, create an automation. Select your wireless button's press event/device trigger, then add the **Lock: Unlock** action targeting the lock entity. Button triggers vary by integration; use the trigger exposed by your button.
+In **Settings → Automations & scenes**, create an automation. Choose your button's press as the trigger, then add **Lock: Unlock** as the action and select the lock. The available button triggers depend on that button's integration.
 
-The action in YAML is:
+The saved unlock information is used automatically. You do not need to include the secret in the automation. For users editing YAML, the action is:
 
 ```yaml
 actions:
@@ -178,61 +223,110 @@ actions:
       entity_id: lock.drawer
 ```
 
-Replace `lock.drawer` with your entity ID. The stored remote code is used automatically; do not put it in automation YAML. Use `lock.unlock` rather than a toggle, which can request unsupported locking. See [Home Assistant lock actions](https://www.home-assistant.io/integrations/lock/).
+Replace `lock.drawer` with your lock's entity ID. Use **Unlock**, not a toggle. See [Home Assistant lock actions](https://www.home-assistant.io/integrations/lock/).
 
-### State, battery, and Activity
+### Understand state and Activity
 
-Lock state and battery percentage come from gateway reports. **Unknown** means no valid value has been received on the current connection. State updates arrive independently of the periodic refresh interval; reported app unlocks and automatic relocks can also update the entity.
+**Locked**, **Unlocked**, and battery percentage come from reports received from the gateway. **Unknown** means no valid report has arrived on the current connection. **Unavailable** means the integration cannot currently reach the gateway or lock.
 
-Home Assistant records locked/unlocked transitions in history and Activity. A successful Home Assistant unlock command also adds **Unlock command acknowledged**, which indicates command acceptance rather than confirmed movement. Physical state changes depend on reports from the selected lock state source.
+History and Activity show received state changes, including automatic relocking. **Unlock command acknowledged** means the gateway acknowledged a Home Assistant unlock command; it is separate from a reported physical state change. Changes missed while disconnected are not downloaded later from Tuya.
 
-History and Activity require [Recorder](https://www.home-assistant.io/integrations/recorder/) and [Activity (`logbook`)](https://www.home-assistant.io/integrations/logbook/), normally enabled in the default Home Assistant configuration. Their filters can exclude entities or events. Changes missed while disconnected are not retrieved from Tuya Cloud.
+## Change a lock's settings
 
-## Managing the integration
+1. Open **Settings → Devices & services → Tuya BLE Lock** → the existing gateway's **⋮ → Reconfigure**.
+2. Choose **Enter local gateway details manually**. Keep the saved address and protocol; leave **Gateway Local Key** blank to keep the saved key. Submit.
+3. Choose **Edit a lock or its code**, select the lock, and submit.
+4. Update [the lock form](#fill-in-the-lock-form). Turn on the DP61 confirmation. To change only the state source, leave both credential fields blank; the saved code stays in place.
+5. Submit, then choose **Save** in **Manage locks**.
 
-### Change gateway or lock settings
+For a T1 / HX201 lock that opens but shows **Unknown**, select **HX201 / T1 cabinet lock (DP40)** as the state source.
 
-Open the integration entry's menu and choose **Reconfigure**. Select **Enter local gateway details manually** to keep your saved gateway settings without cloud credentials, or use cloud discovery to retrieve a changed gateway key and discover locks.
+To remove a lock from Home Assistant, use **Remove a lock from this integration** in **Manage locks**, then **Save**. This does not remove it from the phone app or unpair it from the gateway.
 
-After the gateway check, add, edit, remove, or rediscover locks. To change a lock's state source or remote code, choose **Edit a lock or its code**. Leave key/code fields blank to retain saved values; use **Remove the saved unlock code** when removal is intended. Finish with **Save**. Removing a lock from the integration does not unpair it from Tuya.
+## Update the integration
 
-Use **Configure** to change the status-refresh interval, from 30–600 seconds (default: 60). Incoming state reports are processed between refreshes.
+For a Marketplace installation, install the update from **Settings → Updates**, then restart Home Assistant. On Home Assistant 2026.10, update through HACS. For a manual installation, replace the entire `custom_components/tuya_ble_lock` folder, then restart.
 
-### Update the integration
-
-Update through HACS, or replace the entire `custom_components/tuya_ble_lock` folder with the new version, then restart Home Assistant. Keep the existing integration entry to preserve its settings and entity IDs.
-
-Updates preserve each lock's selected state source. If a T1 / HX201 lock shows **Unknown**, use [Reconfigure](#change-gateway-or-lock-settings) to select **HX201 / T1 cabinet lock (DP40)**.
+Keep the existing gateway entry; its settings, saved codes, and entity IDs are retained. Adding locks uses [Reconfigure](#add-more-locks-to-an-existing-gateway), not an integration update.
 
 ## Troubleshooting
 
-| Symptom | Check |
+| What you see | What to do |
 | --- | --- |
-| Integration missing after installation | Folder is exactly `config/custom_components/tuya_ble_lock`, then restart Home Assistant and refresh the browser. |
-| Cloud permission/authentication error | Correct project credentials and data center; app account linked; API services both subscribed and authorized; trial still active. |
-| Gateway or locks missing from cloud | Correct app account, data center, and gateway binding. A phone-only BLE lock is not a gateway child. |
-| Gateway cannot connect | Private IP, TCP 6668, correct gateway ID/local key/protocol, no Wi-Fi client isolation. Stop other local clients temporarily; some gateways allow few simultaneous connections. |
-| Child offline or missing | Exact node ID; Bluetooth range; batteries; lock listed under this gateway. Wake the lock if its model sleeps. |
-| Device page shows Lock / "This profile supports unlocking only" | Click the lock entity's name, then use the open-padlock / **Unlock** control in its more-info dialog, or run **Lock: Unlock** from Developer tools → Actions. |
-| Unlock rejected | Correct currently registered remote code and member. App activity can replace a code on some models. Do not guess codes or repeatedly retry. |
-| Unlock timeout / outcome unknown | The command may have executed. Inspect the lock before retrying; no cloud fallback or automatic repeat is performed. |
-| Lock state remains Unknown | Check the [lock state source](#6-add-the-gateway-and-its-locks) and gateway connectivity. A command acknowledgement alone cannot establish lock state. |
-| Battery missing or Unknown | Enable the battery entity if you disabled it. A value requires a valid battery report (DP8) from the gateway. |
-| Activity or history entries missing | Check Recorder/Activity filters and connectivity. Command entries require a successful Home Assistant unlock acknowledgement; state entries require gateway state reports. |
-| Stopped working after re-pairing | Re-pairing can change the gateway local key and child identifiers. Retrieve the current values and update the integration. |
+| Tuya BLE Lock is missing from **Add integration** | Restart Home Assistant and refresh the browser after installation. For manual installation, check that `manifest.json` is directly inside `/config/custom_components/tuya_ble_lock/`. |
+| Tuya's device list is empty | Check the linked phone-app account and data center. The project must contain the gateway and the locks you want to add. |
+| Cloud login or permission error | Use the project's Access ID/Secret, not your app password. Re-select the correct data center; check service authorization and trial/subscription status. |
+| **No new compatible locks found**, or setup goes straight to **Manage locks** | Check that each new lock appears under this gateway in the phone app and in the cloud project. Already configured locks are omitted. A failure to read one lock's details can omit that lock; retry discovery after fixing permissions. Unsupported models are not made compatible by entering their IDs manually. |
+| **This gateway is already configured** | Close the add-integration flow. Use the existing gateway's **⋮ → Reconfigure**. |
+| Only **Polling interval** appears | Close **Configure** and use **⋮ → Reconfigure** to add or edit locks. |
+| Gateway connection fails | Check its local IP and protocol. Home Assistant must reach it on the home network; guest Wi-Fi isolation can block this. Temporarily stop other software using the gateway locally. If it was paired again, use cloud discovery to retrieve its new key. |
+| Lock is offline | Check batteries, Bluetooth range, and whether it still appears under the gateway in the app. Wake it if the model sleeps. |
+| **Check/confirm compatibility** or **invalid credentials** on the lock form | Enable the DP61 confirmation. Paste only the command value for this lock; see the [unlock-information guide](docs/remote-unlock-code.md). |
+| Missing code or unlock rejected | Configure the lock's own current unlock information. A new lock added without a code cannot open from Home Assistant. Some app actions can replace the code; retrieve a fresh successful command if necessary. |
+| **This profile supports unlocking only** | Open the lock control's popup and choose **Unlock**, not **Lock**. |
+| Opens, but state is **Unknown** | For the supported T1 / HX201 lock, check the [DP40 state setting](#change-a-locks-settings). An acknowledgement alone does not establish state. |
+| Battery is missing or **Unknown** | Enable its entity if disabled. A value appears after a valid battery report arrives. |
+| No Activity or history | Check connectivity and Home Assistant's [Recorder](https://www.home-assistant.io/integrations/recorder/) and [Activity](https://www.home-assistant.io/integrations/logbook/) settings. They are normally enabled, but filters can exclude a lock. |
 
-For a bug report, include the Home Assistant and integration versions, gateway/lock models, LAN protocol version, steps to reproduce, and the error message. Download diagnostics from **Settings → Devices & services → Tuya BLE Lock → ⋮ → Download diagnostics** before restarting or reloading, since report counters reset on reload.
+For help, include the Home Assistant and integration versions, gateway/lock models, the step you reached, and the exact error. Download diagnostics from the integration entry's **⋮ → Download diagnostics** before reloading or restarting; the diagnostic counters reset on reload.
 
-Diagnostics include anonymous report counters and exclude credentials and raw commands. Review attachments before posting. Never share local keys, remote codes, Access Secrets, account identifiers, or unredacted Tuya exports. Technical details for troubleshooting and contributing hardware support are in [CONTRIBUTING.md](CONTRIBUTING.md).
+Diagnostics omit credentials and raw commands. Review anything you attach to an issue. Keep Access Secrets, gateway keys, unlock values, and unredacted device exports private.
+
+## Advanced setup
+
+### Find the gateway connection version
+
+Skip this for the verified MOES BHUB-C / CR3L gateway using **3.5**. For another gateway, a [TinyTuya network scan](https://github.com/jasonacox/tinytuya#network-scanner) can report its address, ID, and protocol version.
+
+Run this on a computer with Python installed, connected to the **same home network as the gateway**. It is a discovery scan, not an unlock. On macOS/Linux, open Terminal:
+
+```sh
+python3 -m venv tuya-tools
+./tuya-tools/bin/python -m pip install tinytuya==1.20.0
+./tuya-tools/bin/python -m tinytuya scan
+```
+
+On Windows, open PowerShell:
+
+```powershell
+py -m venv tuya-tools
+.\tuya-tools\Scripts\python.exe -m pip install tinytuya==1.20.0
+.\tuya-tools\Scripts\python.exe -m tinytuya scan
+```
+
+Match the gateway by its Device ID and use the reported version. For networks with firewall rules, the scan uses UDP ports 6666, 6667, and 7000. The integration's direct connection uses TCP port **6668**; keep that port private to your home network.
+
+### Manual gateway and lock entry
+
+Use this only if you already have the required identifiers and secrets. Cloud-assisted setup above retrieves most of them for you.
+
+For a new gateway, choose **Add integration → Tuya BLE Lock → Enter local gateway details manually**. For an existing gateway, start from **⋮ → Reconfigure**. Enter or retain the gateway details:
+
+| Value | Meaning |
+| --- | --- |
+| Gateway IPv4 address | The gateway's private address on your home network |
+| Gateway device ID | The gateway's individual Tuya identifier |
+| Gateway Local Key | Its exact 16-byte connection key, including punctuation; blank retains an already saved key |
+| LAN protocol version | `3.5` for the verified gateway, or the observed `3.3`/`3.4`/`3.5` for another model |
+
+After the gateway check, choose **Add a lock manually**. Enter its name, **Lock device ID**, and **Exact child node_id**. The last value is the lock's identifier inside that gateway; it is different from the Device ID and must be copied exactly, not guessed from a Bluetooth MAC address. Complete [the lock form](#fill-in-the-lock-form), repeat for other locks, then choose **Save**.
+
+Missing values can be read through the Tuya project's **API Explorer**: gateway device details include `local_key`; gateway sub-device queries provide each child's Device ID and `node_id`. See [Tuya's device-information API](https://developer.tuya.com/en/docs/cloud/7d3f13ae55?id=Kb2rzcwpmvaci). A cloud-reported `ip` may be a public address, so obtain the local address from your router.
+
+### Compatibility details
+
+The supported unlock format is **HX201-style DP61**, named `remote_no_dp_key`, with an existing eight-digit remote code. Discovery looks for that command in Tuya's device information; a Tuya logo or a similar product name alone does not establish support. See the [command-format reference](docs/remote-unlock-code.md) and [hardware-support guidance](CONTRIBUTING.md).
+
+The known T1 / HX201 profile reports state through **DP40**. Other compatible locks use **Standard lock state (DP47)** if they report their motor state that way. Manual setup defaults to DP47, so select DP40 explicitly for the supported T1. LAN protocols 3.3 and 3.4 are configurable but have not been verified on hardware with this integration.
+
+The integration does not pair hardware or create lock users, codes, fingerprints, or cards. All of that remains in the manufacturer's app.
 
 ## Privacy and security
 
-Local keys and remote codes are stored in Home Assistant's configuration storage. Treat access to the Home Assistant host and its backups as access to the locks. Anyone permitted to run the entity's unlock action can use the saved code. Restrict access accordingly and review any voice-assistant exposure.
+Gateway keys and lock codes are saved in Home Assistant's configuration. Protect access to the server and its backups. Anyone allowed to run a lock's unlock action can use its saved code, including through automations or exposed voice assistants.
 
-The integration's runtime communicates with the configured gateway locally. The gateway and mobile app can still communicate with Tuya independently; using this integration does not disable those connections. Internet blocking and firmware behavior depend on the gateway and are not guaranteed by this project.
+Tuya cloud credentials are used only during discovery and are not saved. The gateway and phone app may still contact Tuya independently; this integration does not disable their internet connections.
 
-## License
+## License and development
 
-[MIT](LICENSE).
-
-For development, tests, and hardware-support contributions, see [CONTRIBUTING.md](CONTRIBUTING.md).
+[MIT](LICENSE). For development and tests, see [CONTRIBUTING.md](CONTRIBUTING.md).
