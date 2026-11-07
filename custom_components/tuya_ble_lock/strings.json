@@ -17,7 +17,10 @@
           "client_id": "Access ID / Client ID",
           "client_secret": "Access Secret / Client Secret",
           "gateway_id": "Gateway device ID",
-          "host": "Gateway IPv4 address"
+          "host": "Gateway IP address"
+        },
+        "data_description": {
+          "host": "Find the gateway in your router's connected-device list and enter its local IP address, for example 192.168.1.50."
         }
       },
       "gateway": {
@@ -25,10 +28,13 @@
         "description": "Use the gateway LAN IPv4 address, device ID, 16-byte Local Key and protocol version. If a key was already imported or saved, leave it blank to keep it. This step only reads child connectivity.",
         "data": {
           "name": "Gateway name",
-          "host": "Gateway IPv4 address",
+          "host": "Gateway IP address",
           "gateway_id": "Gateway device ID",
           "local_key": "Gateway Local Key",
           "protocol_version": "LAN protocol version"
+        },
+        "data_description": {
+          "host": "Find the gateway in your router's connected-device list and enter its local IP address, for example 192.168.1.50."
         }
       },
       "select_locks": {

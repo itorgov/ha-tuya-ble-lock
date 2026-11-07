@@ -130,7 +130,7 @@ Automatic setup retrieves the supported gateway's connection details and each T1
 
 1. Open **Settings → Devices & services → Add integration** and search for **Tuya BLE Lock**.
 2. Choose **Automatic setup**.
-3. On **Connect your gateway**, enter the four values from the [cloud-access table](#prepare-tuya-cloud-access) and the **Gateway IPv4 address** from your router. Check **Project data center** carefully: each new setup starts with **Central Europe**, which may be wrong for your account. Retries in the same setup keep your selected region. Select **Submit**.
+3. On **Connect your gateway**, enter the four values from the [cloud-access table](#prepare-tuya-cloud-access) and the **Gateway IP address** from your router. Check **Project data center** carefully: each new setup starts with **Central Europe**, which may be wrong for your account. Retries in the same setup keep your selected region. Select **Submit**.
 4. On **Select discovered locks**, select the T1 / HX201 locks you want to add, then submit.
 5. On each **Set up…** screen, enter the **Lock name** and optionally select an existing Home Assistant **Area**. Leave Area empty to assign it later. Submit to continue to the next lock. If setup asks you to unlock a lock in the app, follow [these steps](#complete-automatic-unlock-setup), then continue.
 6. Submitting the last lock finishes setup and saves all selected locks. Closing the dialog before that discards your changes.
@@ -223,6 +223,8 @@ To remove a lock from Home Assistant, use **Remove a lock from this integration*
 
 For a Marketplace installation, install the update from **Settings → Updates**, then restart Home Assistant. For a manual installation, replace the entire `custom_components/tuya_ble_lock` folder, then restart.
 
+After restarting, refresh the Home Assistant page in your browser before starting setup. If a form still shows old text or an internal field name such as `host`, close the Home Assistant tab and reopen it. For a manual installation, make sure you also copied the `translations` folder.
+
 Keep the existing gateway entry; its settings, saved codes, and entity IDs are retained. Adding locks uses [Reconfigure](#add-more-locks-to-an-existing-gateway), not an integration update.
 
 ## Troubleshooting
@@ -283,7 +285,7 @@ For a new gateway, choose **Add integration → Tuya BLE Lock → Advanced manua
 
 | Value | Meaning |
 | --- | --- |
-| Gateway IPv4 address | The gateway's private address on your home network |
+| Gateway IP address | The gateway's private address on your home network |
 | Gateway device ID | The gateway's individual Tuya identifier |
 | Gateway Local Key | Its exact 16-byte connection key, including punctuation; blank retains an already saved key |
 | LAN protocol version | `3.5` for the verified gateway, or the observed `3.3`/`3.4`/`3.5` for another model |
